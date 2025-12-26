@@ -47,6 +47,11 @@ function Get-UserConfiguration {
     $primaryDCIP = Read-Host "  Primary Forest DC IP Address [192.168.0.10]"
     if ([string]::IsNullOrWhiteSpace($primaryDCIP)) { $primaryDCIP = "192.168.0.10" }
     
+    # Get Primary DC VM Name for Hyper-V direct connection (required for DNS config)
+    $defaultPrimaryVMName = "uran"
+    $primaryVMName = Read-Host "  Primary DC Hyper-V VM Name [$defaultPrimaryVMName]"
+    if ([string]::IsNullOrWhiteSpace($primaryVMName)) { $primaryVMName = $defaultPrimaryVMName }
+    
     $primaryAdminPassword = Read-Host "  Primary Forest Admin Password [LabAdmin2025!]"
     if ([string]::IsNullOrWhiteSpace($primaryAdminPassword)) { $primaryAdminPassword = "LabAdmin2025!" }
     
@@ -1303,6 +1308,78 @@ Note: This forest will be trusted by parent organization
     Write-Log "C:\temp share created with legacy data" -Level Success
 }
 
+function Verify-PostDeploymentHealth {
+    Write-Log "Running post-deployment health checks..."
+    
+    $securePassword = ConvertTo-SecureString $Config.AdminPassword -AsPlainText -Force
+    $domainCred = New-Object PSCredential("$($Config.ExternalNetBIOS)\Administrator", $securePassword)
+    
+    $healthResults = Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
+        param($PrimaryDomain, $PrimaryDCIP, $ExternalDomain, $SelfIP, $CreateTrust)
+        
+        $results = @{
+            DNSServers = @()
+            PrimaryResolution = $null
+            ReplicationStatus = "N/A (separate forest)"
+            SysvolReady = $false
+            ForwardersConfigured = $false
+        }
+        
+        # Check DNS server configuration
+        $dnsServers = (Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | Select-Object -First 1).ServerAddresses
+        $results.DNSServers = $dnsServers
+        
+        # Check conditional forwarders if trust enabled
+        if ($CreateTrust) {
+            $forwarder = Get-DnsServerZone -Name $PrimaryDomain -ErrorAction SilentlyContinue
+            if ($forwarder -and $forwarder.ZoneType -eq 'Forwarder') {
+                $results.ForwardersConfigured = $true
+            } else {
+                # Try to add it again
+                Add-DnsServerConditionalForwarderZone -Name $PrimaryDomain -MasterServers $PrimaryDCIP -ErrorAction SilentlyContinue
+                $results.ForwardersConfigured = (Get-DnsServerZone -Name $PrimaryDomain -ErrorAction SilentlyContinue) -ne $null
+            }
+            
+            # Test primary domain resolution
+            Clear-DnsClientCache
+            Start-Sleep -Seconds 2
+            try {
+                $primaryResolve = Resolve-DnsName -Name $PrimaryDomain -Type A -DnsOnly -ErrorAction Stop
+                $results.PrimaryResolution = $primaryResolve.IPAddress | Select-Object -First 1
+            } catch {
+                $results.PrimaryResolution = "FAILED"
+            }
+        }
+        
+        # Check SYSVOL
+        $results.SysvolReady = Test-Path "\\$ExternalDomain\SYSVOL\$ExternalDomain\Policies"
+        
+        # Re-register DNS records
+        ipconfig /registerdns | Out-Null
+        nltest /dsregdns 2>&1 | Out-Null
+        
+        return $results
+        
+    } -ArgumentList $Config.PrimaryDomain, $Config.PrimaryDCIP, $Config.ExternalDomain, $Config.VMIP, $Config.CreateTrust
+    
+    # Display results
+    Write-Host ""
+    Write-Host "  Post-Deployment Health Check:" -ForegroundColor Cyan
+    Write-Host "    DNS Servers:        $($healthResults.DNSServers -join ', ')" -ForegroundColor Green
+    if ($Config.CreateTrust) {
+        Write-Host "    Forwarders:         $(if($healthResults.ForwardersConfigured){'Configured'}else{'NOT Configured'})" -ForegroundColor $(if($healthResults.ForwardersConfigured){'Green'}else{'Yellow'})
+        Write-Host "    Primary Resolution: $($Config.PrimaryDomain) -> $($healthResults.PrimaryResolution)" -ForegroundColor $(if($healthResults.PrimaryResolution -eq $Config.PrimaryDCIP){'Green'}else{'Yellow'})
+    }
+    Write-Host "    SYSVOL Ready:       $($healthResults.SysvolReady)" -ForegroundColor $(if($healthResults.SysvolReady){'Green'}else{'Yellow'})
+    Write-Host ""
+    
+    if ($Config.CreateTrust -and $healthResults.PrimaryResolution -ne $Config.PrimaryDCIP) {
+        Write-Log "WARNING: Primary domain resolution may need manual verification before trust creation." -Level Warning
+    } else {
+        Write-Log "Post-deployment health checks passed" -Level Success
+    }
+}
+
 # ============================================
 # MAIN EXECUTION
 # ============================================
@@ -1324,6 +1401,7 @@ try {
     Start-VM -Name $Config.VMName
     
     Install-ExternalForestDC
+    Verify-PostDeploymentHealth
     Install-PrivilegedAdminAccounts
     Install-BulkADObjects
     Install-TempShare
