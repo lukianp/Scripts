@@ -1316,7 +1316,7 @@ Note: This forest will be trusted by parent organization
 }
 
 function Verify-PostDeploymentHealth {
-    Write-Log "Running post-deployment health checks..."
+    Write-Log "Running post-deployment health checks and DNS verification..."
     
     $securePassword = ConvertTo-SecureString $Config.AdminPassword -AsPlainText -Force
     $domainCred = New-Object PSCredential("$($Config.ExternalNetBIOS)\Administrator", $securePassword)
@@ -1326,15 +1326,65 @@ function Verify-PostDeploymentHealth {
         
         $results = @{
             DNSServers = @()
+            DNSFixed = $false
+            SelfResolution = $null
+            GuidResolution = $null
             PrimaryResolution = $null
-            ReplicationStatus = "N/A (separate forest)"
             SysvolReady = $false
             ForwardersConfigured = $false
         }
         
-        # Check DNS server configuration
-        $dnsServers = (Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | Select-Object -First 1).ServerAddresses
-        $results.DNSServers = $dnsServers
+        # CRITICAL: Ensure DNS client points to itself (this DC is its own DNS server)
+        $adapter = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
+        $currentDNS = (Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).ServerAddresses
+        
+        if ($currentDNS -notcontains $SelfIP -or $currentDNS[0] -ne $SelfIP) {
+            Write-Host "  Fixing DNS client configuration..." -ForegroundColor Yellow
+            Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($SelfIP)
+            $results.DNSFixed = $true
+            Start-Sleep -Seconds 3
+        }
+        
+        $results.DNSServers = (Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).ServerAddresses
+        
+        # Clear DNS cache
+        Clear-DnsClientCache
+        Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+        
+        # Re-register DNS records (CRITICAL for DC GUID resolution)
+        Write-Host "  Registering DNS records..." -ForegroundColor Cyan
+        ipconfig /registerdns | Out-Null
+        Start-Sleep -Seconds 5
+        nltest /dsregdns 2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+        
+        # Test self-resolution (hostname)
+        try {
+            $selfResolve = Resolve-DnsName -Name "$env:COMPUTERNAME.$ExternalDomain" -Type A -DnsOnly -ErrorAction Stop
+            $results.SelfResolution = $selfResolve.IPAddress | Select-Object -First 1
+        } catch {
+            $results.SelfResolution = "FAILED"
+        }
+        
+        # Test DC GUID resolution (critical for dcdiag)
+        try {
+            # Get the DC's GUID from AD
+            Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+            $dcGuid = (Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction SilentlyContinue).InvocationId.Guid
+            if ($dcGuid) {
+                $guidRecord = "$dcGuid._msdcs.$ExternalDomain"
+                $guidResolve = Resolve-DnsName -Name $guidRecord -Type CNAME -DnsOnly -ErrorAction SilentlyContinue
+                if ($guidResolve) {
+                    $results.GuidResolution = "OK"
+                } else {
+                    $results.GuidResolution = "MISSING"
+                    # Force DNS re-registration
+                    nltest /dsregdns 2>&1 | Out-Null
+                }
+            }
+        } catch {
+            $results.GuidResolution = "UNKNOWN"
+        }
         
         # Check conditional forwarders if trust enabled
         if ($CreateTrust) {
@@ -1342,13 +1392,13 @@ function Verify-PostDeploymentHealth {
             if ($forwarder -and $forwarder.ZoneType -eq 'Forwarder') {
                 $results.ForwardersConfigured = $true
             } else {
-                # Try to add it again
+                # Try to add it
                 Add-DnsServerConditionalForwarderZone -Name $PrimaryDomain -MasterServers $PrimaryDCIP -ErrorAction SilentlyContinue
+                Add-DnsServerConditionalForwarderZone -Name "_msdcs.$PrimaryDomain" -MasterServers $PrimaryDCIP -ErrorAction SilentlyContinue
                 $results.ForwardersConfigured = (Get-DnsServerZone -Name $PrimaryDomain -ErrorAction SilentlyContinue) -ne $null
             }
             
             # Test primary domain resolution
-            Clear-DnsClientCache
             Start-Sleep -Seconds 2
             try {
                 $primaryResolve = Resolve-DnsName -Name $PrimaryDomain -Type A -DnsOnly -ErrorAction Stop
@@ -1361,10 +1411,6 @@ function Verify-PostDeploymentHealth {
         # Check SYSVOL
         $results.SysvolReady = Test-Path "\\$ExternalDomain\SYSVOL\$ExternalDomain\Policies"
         
-        # Re-register DNS records
-        ipconfig /registerdns | Out-Null
-        nltest /dsregdns 2>&1 | Out-Null
-        
         return $results
         
     } -ArgumentList $Config.PrimaryDomain, $Config.PrimaryDCIP, $Config.ExternalDomain, $Config.VMIP, $Config.CreateTrust
@@ -1372,12 +1418,38 @@ function Verify-PostDeploymentHealth {
     # Display results
     Write-Host ""
     Write-Host "  Post-Deployment Health Check:" -ForegroundColor Cyan
-    Write-Host "    DNS Servers:        $($healthResults.DNSServers -join ', ')" -ForegroundColor Green
+    Write-Host "    DNS Servers:        $($healthResults.DNSServers -join ', ')" -ForegroundColor $(if($healthResults.DNSServers -contains $Config.VMIP){'Green'}else{'Red'})
+    if ($healthResults.DNSFixed) {
+        Write-Host "    DNS Config:         Fixed (was misconfigured)" -ForegroundColor Yellow
+    }
+    Write-Host "    Self Resolution:    $($healthResults.SelfResolution)" -ForegroundColor $(if($healthResults.SelfResolution -eq $Config.VMIP){'Green'}else{'Red'})
+    Write-Host "    DC GUID Record:     $($healthResults.GuidResolution)" -ForegroundColor $(if($healthResults.GuidResolution -eq 'OK'){'Green'}else{'Yellow'})
     if ($Config.CreateTrust) {
         Write-Host "    Forwarders:         $(if($healthResults.ForwardersConfigured){'Configured'}else{'NOT Configured'})" -ForegroundColor $(if($healthResults.ForwardersConfigured){'Green'}else{'Yellow'})
         Write-Host "    Primary Resolution: $($Config.PrimaryDomain) -> $($healthResults.PrimaryResolution)" -ForegroundColor $(if($healthResults.PrimaryResolution -eq $Config.PrimaryDCIP){'Green'}else{'Yellow'})
     }
     Write-Host "    SYSVOL Ready:       $($healthResults.SysvolReady)" -ForegroundColor $(if($healthResults.SysvolReady){'Green'}else{'Yellow'})
+    Write-Host ""
+    
+    if ($healthResults.SelfResolution -ne $Config.VMIP -or $healthResults.GuidResolution -ne 'OK') {
+        Write-Log "WARNING: DNS resolution issues detected. Running additional DNS repair..." -Level Warning
+        
+        # Additional repair attempt
+        Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
+            # Restart DNS Server service
+            Restart-Service DNS -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 10
+            
+            # Force re-registration
+            ipconfig /registerdns
+            nltest /dsregdns 2>&1 | Out-Null
+            
+            Write-Host "  DNS repair completed - please verify with dcdiag" -ForegroundColor Yellow
+        }
+    } else {
+        Write-Log "Post-deployment health checks passed" -Level Success
+    }
+}
     Write-Host ""
     
     if ($Config.CreateTrust -and $healthResults.PrimaryResolution -ne $Config.PrimaryDCIP) {
