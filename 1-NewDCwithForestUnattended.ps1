@@ -826,10 +826,11 @@ function Install-DomainController {
     # Verify DNS zone was created during DC promotion
     Write-Log "Verifying DNS zone configuration..."
     Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
-        param($DomainName)
+        param($DomainName, $DCIP)
         
         Import-Module DnsServer -ErrorAction SilentlyContinue
         
+        # Check primary zone
         $zone = Get-DnsServerZone -Name $DomainName -ErrorAction SilentlyContinue
         if (-not $zone) {
             Write-Host "  DNS zone '$DomainName' not found - creating..." -ForegroundColor Yellow
@@ -843,6 +844,25 @@ function Install-DomainController {
             Write-Host "  DNS zone '$DomainName' exists" -ForegroundColor Green
         }
         
+        # Check _msdcs zone (critical for DC GUID resolution)
+        $msdcsZone = "_msdcs.$DomainName"
+        $msdcsExists = Get-DnsServerZone -Name $msdcsZone -ErrorAction SilentlyContinue
+        if (-not $msdcsExists) {
+            Write-Host "  _msdcs zone not found - creating..." -ForegroundColor Yellow
+            try {
+                Add-DnsServerPrimaryZone -Name $msdcsZone -ReplicationScope Forest -DynamicUpdate Secure -ErrorAction Stop
+                Write-Host "  _msdcs zone created successfully" -ForegroundColor Green
+            } catch {
+                Write-Host "  WARNING: Could not create _msdcs zone: $_" -ForegroundColor Red
+            }
+        } else {
+            Write-Host "  _msdcs zone '$msdcsZone' exists" -ForegroundColor Green
+        }
+        
+        # Ensure DNS client points to itself
+        $adapter = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
+        Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($DCIP)
+        
         # Also verify the DC has an A record
         $dcRecord = Get-DnsServerResourceRecord -ZoneName $DomainName -Name "@" -RRType A -ErrorAction SilentlyContinue
         if (-not $dcRecord) {
@@ -853,7 +873,12 @@ function Install-DomainController {
                 Write-Host "  Created A records for DC" -ForegroundColor Green
             }
         }
-    } -ArgumentList $Config.DomainName
+        
+        # Register DNS records
+        ipconfig /registerdns | Out-Null
+        nltest /dsregdns 2>&1 | Out-Null
+        
+    } -ArgumentList $Config.DomainName, $Config.VMIP
     
     # Create base objects and service account - with retry logic
     Write-Log "Creating base AD objects..."
