@@ -1368,7 +1368,7 @@ function Verify-TrustRelationship {
 }
 
 function Verify-PostDeploymentHealth {
-    Write-Log "Running post-deployment health checks..."
+    Write-Log "Running post-deployment health checks and DNS verification..."
     
     $securePassword = ConvertTo-SecureString $Config.AdminPassword -AsPlainText -Force
     $childDomainCred = New-Object PSCredential("$($Config.ChildNetBIOS)\Administrator", $securePassword)
@@ -1378,30 +1378,73 @@ function Verify-PostDeploymentHealth {
         
         $results = @{
             DNSServers = @()
+            DNSFixed = $false
+            SelfResolution = $null
+            GuidResolution = $null
             ParentResolution = $null
             ParentDCResolution = $null
             ReplicationStatus = $null
             SysvolReady = $false
         }
         
-        # Check DNS server configuration
-        $dnsServers = (Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | Select-Object -First 1).ServerAddresses
-        $results.DNSServers = $dnsServers
+        # CRITICAL: Ensure DNS client points to self first, then parent
+        $adapter = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
+        $currentDNS = (Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).ServerAddresses
         
-        # Verify DNS includes both self and parent
-        $hasSelf = $dnsServers -contains $SelfIP
-        $hasParent = $dnsServers -contains $ParentDCIP
+        $needsFix = $false
+        if ($currentDNS.Count -lt 2) { $needsFix = $true }
+        elseif ($currentDNS[0] -ne $SelfIP) { $needsFix = $true }
+        elseif ($currentDNS -notcontains $ParentDCIP) { $needsFix = $true }
         
-        if (-not $hasParent) {
-            Write-Host "  WARNING: Parent DC not in DNS servers - adding..." -ForegroundColor Yellow
-            $adapter = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
+        if ($needsFix) {
+            Write-Host "  Fixing DNS client configuration..." -ForegroundColor Yellow
             Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($SelfIP, $ParentDCIP)
-            $results.DNSServers = @($SelfIP, $ParentDCIP)
+            $results.DNSFixed = $true
+            Start-Sleep -Seconds 3
+        }
+        
+        $results.DNSServers = (Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).ServerAddresses
+        
+        # Clear DNS cache
+        Clear-DnsClientCache
+        Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+        
+        # Re-register DNS records (CRITICAL for DC GUID resolution)
+        Write-Host "  Registering DNS records..." -ForegroundColor Cyan
+        ipconfig /registerdns | Out-Null
+        Start-Sleep -Seconds 5
+        nltest /dsregdns 2>&1 | Out-Null
+        Start-Sleep -Seconds 3
+        
+        # Test self-resolution (hostname)
+        try {
+            $selfResolve = Resolve-DnsName -Name "$env:COMPUTERNAME.$ChildDomain" -Type A -DnsOnly -ErrorAction Stop
+            $results.SelfResolution = $selfResolve.IPAddress | Select-Object -First 1
+        } catch {
+            $results.SelfResolution = "FAILED"
+        }
+        
+        # Test DC GUID resolution (critical for dcdiag)
+        try {
+            Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+            $dcGuid = (Get-ADDomainController -Identity $env:COMPUTERNAME -ErrorAction SilentlyContinue).InvocationId.Guid
+            if ($dcGuid) {
+                # For child domain, GUID record is in parent's _msdcs zone
+                $parentDomainRoot = ($ChildDomain -split '\.', 2)[1]  # Get parent domain from child FQDN
+                $guidRecord = "$dcGuid._msdcs.$parentDomainRoot"
+                $guidResolve = Resolve-DnsName -Name $guidRecord -Type CNAME -DnsOnly -ErrorAction SilentlyContinue
+                if ($guidResolve) {
+                    $results.GuidResolution = "OK"
+                } else {
+                    $results.GuidResolution = "MISSING"
+                    nltest /dsregdns 2>&1 | Out-Null
+                }
+            }
+        } catch {
+            $results.GuidResolution = "UNKNOWN"
         }
         
         # Test parent domain resolution
-        Clear-DnsClientCache
-        Start-Sleep -Seconds 2
         try {
             $parentResolve = Resolve-DnsName -Name $ParentDomain -Type A -DnsOnly -ErrorAction Stop
             $results.ParentResolution = $parentResolve.IPAddress | Select-Object -First 1
@@ -1428,10 +1471,6 @@ function Verify-PostDeploymentHealth {
             $results.ReplicationStatus = "Failed to initiate"
         }
         
-        # Re-register DNS records
-        ipconfig /registerdns | Out-Null
-        nltest /dsregdns 2>&1 | Out-Null
-        
         # Check SYSVOL
         $results.SysvolReady = Test-Path "\\$ChildDomain\SYSVOL\$ChildDomain\Policies"
         
@@ -1443,6 +1482,11 @@ function Verify-PostDeploymentHealth {
     Write-Host ""
     Write-Host "  Post-Deployment Health Check:" -ForegroundColor Cyan
     Write-Host "    DNS Servers:        $($healthResults.DNSServers -join ', ')" -ForegroundColor $(if($healthResults.DNSServers.Count -ge 2){'Green'}else{'Yellow'})
+    if ($healthResults.DNSFixed) {
+        Write-Host "    DNS Config:         Fixed (was misconfigured)" -ForegroundColor Yellow
+    }
+    Write-Host "    Self Resolution:    $($healthResults.SelfResolution)" -ForegroundColor $(if($healthResults.SelfResolution -eq $Config.VMIP){'Green'}else{'Red'})
+    Write-Host "    DC GUID Record:     $($healthResults.GuidResolution)" -ForegroundColor $(if($healthResults.GuidResolution -eq 'OK'){'Green'}else{'Yellow'})
     Write-Host "    Parent Resolution:  $($Config.ParentDomain) -> $($healthResults.ParentResolution)" -ForegroundColor $(if($healthResults.ParentResolution -eq $Config.ParentDCIP){'Green'}else{'Red'})
     if ($healthResults.ParentDCResolution) {
         Write-Host "    Parent DC:          $($healthResults.ParentDCResolution)" -ForegroundColor Green
@@ -1451,7 +1495,17 @@ function Verify-PostDeploymentHealth {
     Write-Host "    SYSVOL Ready:       $($healthResults.SysvolReady)" -ForegroundColor $(if($healthResults.SysvolReady){'Green'}else{'Yellow'})
     Write-Host ""
     
-    if ($healthResults.ParentResolution -ne $Config.ParentDCIP) {
+    if ($healthResults.SelfResolution -ne $Config.VMIP -or $healthResults.GuidResolution -ne 'OK') {
+        Write-Log "WARNING: DNS resolution issues detected. Running additional DNS repair..." -Level Warning
+        
+        Invoke-Command -VMName $Config.VMName -Credential $childDomainCred -ScriptBlock {
+            Restart-Service DNS -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 10
+            ipconfig /registerdns
+            nltest /dsregdns 2>&1 | Out-Null
+            Write-Host "  DNS repair completed - please verify with dcdiag" -ForegroundColor Yellow
+        }
+    } elseif ($healthResults.ParentResolution -ne $Config.ParentDCIP) {
         Write-Log "WARNING: Parent domain resolution incorrect. You may need to manually verify DNS." -Level Warning
     } else {
         Write-Log "Post-deployment health checks passed" -Level Success
