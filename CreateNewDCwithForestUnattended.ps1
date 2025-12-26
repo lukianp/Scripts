@@ -743,6 +743,25 @@ function Install-DomainController {
                     $dns = Get-Service DNS -ErrorAction SilentlyContinue
                     $adws = Get-Service ADWS -ErrorAction SilentlyContinue
                     
+                    # CRITICAL: Enable and start ADWS if it's not running
+                    if ($adws) {
+                        # First, ensure startup type is Automatic (not Disabled!)
+                        if ($adws.StartType -eq 'Disabled') {
+                            Set-Service ADWS -StartupType Automatic -ErrorAction SilentlyContinue
+                        }
+                        
+                        # Now start it if stopped
+                        if ($adws.Status -ne 'Running') {
+                            try {
+                                Start-Service ADWS -ErrorAction Stop
+                                Start-Sleep -Seconds 5
+                                $adws = Get-Service ADWS
+                            } catch {
+                                # May need NTDS fully ready first, will retry
+                            }
+                        }
+                    }
+                    
                     $status = @{
                         NTDS = if ($ntds) { $ntds.Status.ToString() } else { "NotFound" }
                         DNS = if ($dns) { $dns.Status.ToString() } else { "NotFound" }
@@ -787,7 +806,11 @@ function Install-DomainController {
         
         try {
             Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
-                Restart-Service ADWS -Force -ErrorAction SilentlyContinue
+                # Force start ADWS
+                Set-Service ADWS -StartupType Automatic -ErrorAction SilentlyContinue
+                Stop-Service ADWS -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 5
+                Start-Service ADWS -ErrorAction Stop
                 Start-Sleep -Seconds 20
                 Get-ADDomain -ErrorAction Stop | Out-Null
             } -ErrorAction Stop
@@ -799,6 +822,38 @@ function Install-DomainController {
         }
         Start-Sleep -Seconds 15
     }
+    
+    # Verify DNS zone was created during DC promotion
+    Write-Log "Verifying DNS zone configuration..."
+    Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
+        param($DomainName)
+        
+        Import-Module DnsServer -ErrorAction SilentlyContinue
+        
+        $zone = Get-DnsServerZone -Name $DomainName -ErrorAction SilentlyContinue
+        if (-not $zone) {
+            Write-Host "  DNS zone '$DomainName' not found - creating..." -ForegroundColor Yellow
+            try {
+                Add-DnsServerPrimaryZone -Name $DomainName -ReplicationScope Domain -DynamicUpdate Secure -ErrorAction Stop
+                Write-Host "  DNS zone created successfully" -ForegroundColor Green
+            } catch {
+                Write-Host "  WARNING: Could not create DNS zone: $_" -ForegroundColor Red
+            }
+        } else {
+            Write-Host "  DNS zone '$DomainName' exists" -ForegroundColor Green
+        }
+        
+        # Also verify the DC has an A record
+        $dcRecord = Get-DnsServerResourceRecord -ZoneName $DomainName -Name "@" -RRType A -ErrorAction SilentlyContinue
+        if (-not $dcRecord) {
+            $dcIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike "127.*" } | Select-Object -First 1).IPAddress
+            if ($dcIP) {
+                Add-DnsServerResourceRecordA -ZoneName $DomainName -Name "@" -IPv4Address $dcIP -ErrorAction SilentlyContinue
+                Add-DnsServerResourceRecordA -ZoneName $DomainName -Name $env:COMPUTERNAME -IPv4Address $dcIP -ErrorAction SilentlyContinue
+                Write-Host "  Created A records for DC" -ForegroundColor Green
+            }
+        }
+    } -ArgumentList $Config.DomainName
     
     # Create base objects and service account - with retry logic
     Write-Log "Creating base AD objects..."
@@ -960,97 +1015,10 @@ function Install-BulkADObjects {
     $securePassword = ConvertTo-SecureString $Config.AdminPassword -AsPlainText -Force
     $domainCred = New-Object PSCredential("$($Config.DomainNetBIOS)\Administrator", $securePassword)
     
-    # Get the domain DN parts
-    $domainParts = $Config.DomainName -split '\.'
-    $domainDN = ($domainParts | ForEach-Object { "DC=$_" }) -join ','
-    
-    # ===== EMBEDDED OU DATA =====
-    $ousData = @"
-name,path
-$($Config.DomainNetBIOS) Groups,$domainDN
-$($Config.DomainNetBIOS) Users,$domainDN
-Marketing,OU=$($Config.DomainNetBIOS) Users,$domainDN
-HR,OU=$($Config.DomainNetBIOS) Users,$domainDN
-IT,OU=$($Config.DomainNetBIOS) Users,$domainDN
-Accounting,OU=$($Config.DomainNetBIOS) Users,$domainDN
-Management,OU=$($Config.DomainNetBIOS) Users,$domainDN
-PR,OU=$($Config.DomainNetBIOS) Users,$domainDN
-Operations,OU=$($Config.DomainNetBIOS) Users,$domainDN
-Legal,OU=$($Config.DomainNetBIOS) Users,$domainDN
-Purchasing,OU=$($Config.DomainNetBIOS) Users,$domainDN
-$($Config.DomainNetBIOS) Computers,$domainDN
-Marketing,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-HR,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-IT,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-Accounting,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-Management,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-PR,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-Operations,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-Legal,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-Purchasing,OU=$($Config.DomainNetBIOS) Computers,$domainDN
-"@
-
-    # ===== EMBEDDED GROUPS DATA =====
-    $groupsData = @"
-name,path,scope,category,description
-Marketing_Local,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Marketing Local Group
-Marketing_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Marketing Folders Access
-Accounting_Printers,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Accounting Printers Access
-Accounting_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Accounting Folders Access
-Accounting_Local,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Accounting Local Group
-HR_Local,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,HR Local Group
-HR_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,HR Folders Access
-IT_Printers,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,IT Printers Access
-IT_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,IT Folders Access
-IT_Local,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,IT Local Group
-Management_Printers,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Management Printers Access
-Management_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Management Folders Access
-PR_Printers,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,PR Printers Access
-PR_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,PR Folders Access
-Operations_Printers,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Operations Printers Access
-Operations_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Operations Folders Access
-Legal_Printers,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Legal Printers Access
-Legal_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Legal Folders Access
-Purchasing_Printers,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Purchasing Printers Access
-Purchasing_Folders,OU=$($Config.DomainNetBIOS) Groups~$domainDN,DomainLocal,Security,Purchasing Folders Access
-"@
-
-    # ===== EMBEDDED SAMPLE USERS DATA =====
-    # Creating 50 sample users across departments (enough for testing, not 3000 to keep it fast)
-    $usersData = @"
-SamAccountName,Password,Path,Department,GivenName,Surname,Name,DisplayName,Title,Email
-john.smith,P@ssw0rd123!,OU=IT~OU=$($Config.DomainNetBIOS) Users~$domainDN,IT,John,Smith,John Smith,John Smith,IT Administrator,john.smith@$($Config.DomainName)
-jane.doe,P@ssw0rd123!,OU=HR~OU=$($Config.DomainNetBIOS) Users~$domainDN,HR,Jane,Doe,Jane Doe,Jane Doe,HR Manager,jane.doe@$($Config.DomainName)
-bob.wilson,P@ssw0rd123!,OU=Marketing~OU=$($Config.DomainNetBIOS) Users~$domainDN,Marketing,Bob,Wilson,Bob Wilson,Bob Wilson,Marketing Lead,bob.wilson@$($Config.DomainName)
-alice.johnson,P@ssw0rd123!,OU=Accounting~OU=$($Config.DomainNetBIOS) Users~$domainDN,Accounting,Alice,Johnson,Alice Johnson,Alice Johnson,Senior Accountant,alice.johnson@$($Config.DomainName)
-charlie.brown,P@ssw0rd123!,OU=Management~OU=$($Config.DomainNetBIOS) Users~$domainDN,Management,Charlie,Brown,Charlie Brown,Charlie Brown,Operations Manager,charlie.brown@$($Config.DomainName)
-diana.ross,P@ssw0rd123!,OU=Legal~OU=$($Config.DomainNetBIOS) Users~$domainDN,Legal,Diana,Ross,Diana Ross,Diana Ross,Legal Counsel,diana.ross@$($Config.DomainName)
-edward.jones,P@ssw0rd123!,OU=IT~OU=$($Config.DomainNetBIOS) Users~$domainDN,IT,Edward,Jones,Edward Jones,Edward Jones,System Administrator,edward.jones@$($Config.DomainName)
-fiona.green,P@ssw0rd123!,OU=HR~OU=$($Config.DomainNetBIOS) Users~$domainDN,HR,Fiona,Green,Fiona Green,Fiona Green,HR Specialist,fiona.green@$($Config.DomainName)
-george.white,P@ssw0rd123!,OU=Marketing~OU=$($Config.DomainNetBIOS) Users~$domainDN,Marketing,George,White,George White,George White,Marketing Analyst,george.white@$($Config.DomainName)
-helen.black,P@ssw0rd123!,OU=Operations~OU=$($Config.DomainNetBIOS) Users~$domainDN,Operations,Helen,Black,Helen Black,Helen Black,Operations Analyst,helen.black@$($Config.DomainName)
-ivan.gray,P@ssw0rd123!,OU=IT~OU=$($Config.DomainNetBIOS) Users~$domainDN,IT,Ivan,Gray,Ivan Gray,Ivan Gray,Network Engineer,ivan.gray@$($Config.DomainName)
-julia.adams,P@ssw0rd123!,OU=Accounting~OU=$($Config.DomainNetBIOS) Users~$domainDN,Accounting,Julia,Adams,Julia Adams,Julia Adams,Accountant,julia.adams@$($Config.DomainName)
-kevin.miller,P@ssw0rd123!,OU=PR~OU=$($Config.DomainNetBIOS) Users~$domainDN,PR,Kevin,Miller,Kevin Miller,Kevin Miller,PR Specialist,kevin.miller@$($Config.DomainName)
-laura.davis,P@ssw0rd123!,OU=Purchasing~OU=$($Config.DomainNetBIOS) Users~$domainDN,Purchasing,Laura,Davis,Laura Davis,Laura Davis,Purchasing Agent,laura.davis@$($Config.DomainName)
-mike.taylor,P@ssw0rd123!,OU=IT~OU=$($Config.DomainNetBIOS) Users~$domainDN,IT,Mike,Taylor,Mike Taylor,Mike Taylor,Help Desk Analyst,mike.taylor@$($Config.DomainName)
-nancy.moore,P@ssw0rd123!,OU=HR~OU=$($Config.DomainNetBIOS) Users~$domainDN,HR,Nancy,Moore,Nancy Moore,Nancy Moore,Recruiter,nancy.moore@$($Config.DomainName)
-oscar.martinez,P@ssw0rd123!,OU=Accounting~OU=$($Config.DomainNetBIOS) Users~$domainDN,Accounting,Oscar,Martinez,Oscar Martinez,Oscar Martinez,Accounting Clerk,oscar.martinez@$($Config.DomainName)
-patricia.lee,P@ssw0rd123!,OU=Legal~OU=$($Config.DomainNetBIOS) Users~$domainDN,Legal,Patricia,Lee,Patricia Lee,Patricia Lee,Paralegal,patricia.lee@$($Config.DomainName)
-quincy.harris,P@ssw0rd123!,OU=Operations~OU=$($Config.DomainNetBIOS) Users~$domainDN,Operations,Quincy,Harris,Quincy Harris,Quincy Harris,Operations Coordinator,quincy.harris@$($Config.DomainName)
-rachel.clark,P@ssw0rd123!,OU=Marketing~OU=$($Config.DomainNetBIOS) Users~$domainDN,Marketing,Rachel,Clark,Rachel Clark,Rachel Clark,Content Writer,rachel.clark@$($Config.DomainName)
-steve.walker,P@ssw0rd123!,OU=IT~OU=$($Config.DomainNetBIOS) Users~$domainDN,IT,Steve,Walker,Steve Walker,Steve Walker,Security Analyst,steve.walker@$($Config.DomainName)
-tina.hall,P@ssw0rd123!,OU=Management~OU=$($Config.DomainNetBIOS) Users~$domainDN,Management,Tina,Hall,Tina Hall,Tina Hall,Project Manager,tina.hall@$($Config.DomainName)
-victor.young,P@ssw0rd123!,OU=Purchasing~OU=$($Config.DomainNetBIOS) Users~$domainDN,Purchasing,Victor,Young,Victor Young,Victor Young,Procurement Specialist,victor.young@$($Config.DomainName)
-wendy.king,P@ssw0rd123!,OU=PR~OU=$($Config.DomainNetBIOS) Users~$domainDN,PR,Wendy,King,Wendy King,Wendy King,Communications Manager,wendy.king@$($Config.DomainName)
-xavier.scott,P@ssw0rd123!,OU=IT~OU=$($Config.DomainNetBIOS) Users~$domainDN,IT,Xavier,Scott,Xavier Scott,Xavier Scott,Database Administrator,xavier.scott@$($Config.DomainName)
-"@
-
-    # Copy data to VM and create objects
-    Write-Log "Transferring data to VM..."
-    
+    # Create OUs
+    Write-Log "Creating Organizational Units..."
     Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
-        param($OusData, $GroupsData, $UsersData)
+        param($NetBIOS)
         
         # Ensure ADWS is running
         $adws = Get-Service ADWS -ErrorAction SilentlyContinue
@@ -1061,121 +1029,169 @@ xavier.scott,P@ssw0rd123!,OU=IT~OU=$($Config.DomainNetBIOS) Users~$domainDN,IT,X
         
         Import-Module ActiveDirectory
         
-        # Create C:\it directory
-        New-Item -ItemType Directory -Path "C:\it" -Force | Out-Null
+        # Get the actual domain DN from AD
+        $domainDN = (Get-ADDomain).DistinguishedName
         
-        # Write CSV files (using ~ as delimiter workaround, will replace with comma)
-        $OusData | Out-File "C:\it\ous.csv" -Encoding UTF8 -Force
-        $GroupsData -replace '~',',' | Out-File "C:\it\groups.csv" -Encoding UTF8 -Force
-        $UsersData -replace '~',',' | Out-File "C:\it\users.csv" -Encoding UTF8 -Force
+        # Define OUs as array (not CSV to avoid comma issues)
+        $ous = @(
+            @{ Name = "$NetBIOS Users"; Path = $domainDN }
+            @{ Name = "$NetBIOS Groups"; Path = $domainDN }
+            @{ Name = "$NetBIOS Computers"; Path = $domainDN }
+            @{ Name = "Marketing"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "HR"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "IT"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "Accounting"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "Management"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "PR"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "Operations"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "Legal"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "Purchasing"; Path = "OU=$NetBIOS Users,$domainDN" }
+            @{ Name = "Marketing"; Path = "OU=$NetBIOS Computers,$domainDN" }
+            @{ Name = "HR"; Path = "OU=$NetBIOS Computers,$domainDN" }
+            @{ Name = "IT"; Path = "OU=$NetBIOS Computers,$domainDN" }
+            @{ Name = "Accounting"; Path = "OU=$NetBIOS Computers,$domainDN" }
+            @{ Name = "Management"; Path = "OU=$NetBIOS Computers,$domainDN" }
+            @{ Name = "PR"; Path = "OU=$NetBIOS Computers,$domainDN" }
+            @{ Name = "Operations"; Path = "OU=$NetBIOS Computers,$domainDN" }
+            @{ Name = "Legal"; Path = "OU=$NetBIOS Computers,$domainDN" }
+            @{ Name = "Purchasing"; Path = "OU=$NetBIOS Computers,$domainDN" }
+        )
         
-        Write-Host "CSV files created in C:\it" -ForegroundColor Green
-        
-    } -ArgumentList $ousData, $groupsData, $usersData
-    
-    # Create OUs
-    Write-Log "Creating Organizational Units..."
-    Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
-        Import-Module ActiveDirectory
-        $ous = Import-Csv "C:\it\ous.csv"
         $created = 0
         $skipped = 0
         
         foreach ($ou in $ous) {
-            $name = $ou.name.Trim()
-            $path = $ou.path.Trim()
-            
             try {
-                $existingOU = Get-ADOrganizationalUnit -Filter "Name -eq '$name'" -SearchBase $path -SearchScope OneLevel -ErrorAction SilentlyContinue
+                $existingOU = Get-ADOrganizationalUnit -Filter "Name -eq '$($ou.Name)'" -SearchBase $ou.Path -SearchScope OneLevel -ErrorAction SilentlyContinue
                 if (-not $existingOU) {
-                    New-ADOrganizationalUnit -Name $name -Path $path -ProtectedFromAccidentalDeletion $false -ErrorAction Stop
+                    New-ADOrganizationalUnit -Name $ou.Name -Path $ou.Path -ProtectedFromAccidentalDeletion $false -ErrorAction Stop
                     $created++
                 } else {
                     $skipped++
                 }
             } catch {
-                Write-Warning "Failed to create OU '$name' at '$path': $_"
+                Write-Warning "Failed to create OU '$($ou.Name)' at '$($ou.Path)': $_"
             }
         }
         Write-Host "  OUs created: $created, skipped: $skipped" -ForegroundColor Cyan
-    }
+        
+    } -ArgumentList $Config.DomainNetBIOS
     
     # Create Groups
     Write-Log "Creating Security Groups..."
     Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
+        param($NetBIOS)
+        
         Import-Module ActiveDirectory
-        $groups = Import-Csv "C:\it\groups.csv"
+        $domainDN = (Get-ADDomain).DistinguishedName
+        $groupsPath = "OU=$NetBIOS Groups,$domainDN"
+        
+        $groups = @(
+            @{ Name = "Marketing_Local"; Scope = "DomainLocal"; Desc = "Marketing Local Group" }
+            @{ Name = "Marketing_Folders"; Scope = "DomainLocal"; Desc = "Marketing Folders Access" }
+            @{ Name = "Accounting_Printers"; Scope = "DomainLocal"; Desc = "Accounting Printers Access" }
+            @{ Name = "Accounting_Folders"; Scope = "DomainLocal"; Desc = "Accounting Folders Access" }
+            @{ Name = "Accounting_Local"; Scope = "DomainLocal"; Desc = "Accounting Local Group" }
+            @{ Name = "HR_Local"; Scope = "DomainLocal"; Desc = "HR Local Group" }
+            @{ Name = "HR_Folders"; Scope = "DomainLocal"; Desc = "HR Folders Access" }
+            @{ Name = "IT_Printers"; Scope = "DomainLocal"; Desc = "IT Printers Access" }
+            @{ Name = "IT_Folders"; Scope = "DomainLocal"; Desc = "IT Folders Access" }
+            @{ Name = "IT_Local"; Scope = "DomainLocal"; Desc = "IT Local Group" }
+            @{ Name = "Management_Printers"; Scope = "DomainLocal"; Desc = "Management Printers Access" }
+            @{ Name = "Management_Folders"; Scope = "DomainLocal"; Desc = "Management Folders Access" }
+            @{ Name = "PR_Printers"; Scope = "DomainLocal"; Desc = "PR Printers Access" }
+            @{ Name = "PR_Folders"; Scope = "DomainLocal"; Desc = "PR Folders Access" }
+            @{ Name = "Operations_Printers"; Scope = "DomainLocal"; Desc = "Operations Printers Access" }
+            @{ Name = "Operations_Folders"; Scope = "DomainLocal"; Desc = "Operations Folders Access" }
+            @{ Name = "Legal_Printers"; Scope = "DomainLocal"; Desc = "Legal Printers Access" }
+            @{ Name = "Legal_Folders"; Scope = "DomainLocal"; Desc = "Legal Folders Access" }
+            @{ Name = "Purchasing_Printers"; Scope = "DomainLocal"; Desc = "Purchasing Printers Access" }
+            @{ Name = "Purchasing_Folders"; Scope = "DomainLocal"; Desc = "Purchasing Folders Access" }
+        )
+        
         $created = 0
         $skipped = 0
         
         foreach ($group in $groups) {
-            $name = $group.name.Trim()
             try {
-                if (-not (Get-ADGroup -Filter "Name -eq '$name'" -ErrorAction SilentlyContinue)) {
-                    $groupParams = @{
-                        Name          = $name
-                        Path          = $group.path.Trim()
-                        GroupScope    = $group.scope.Trim()
-                        GroupCategory = $group.category.Trim()
-                        Description   = $group.description
-                    }
-                    New-ADGroup @groupParams -ErrorAction Stop
+                if (-not (Get-ADGroup -Filter "Name -eq '$($group.Name)'" -ErrorAction SilentlyContinue)) {
+                    New-ADGroup -Name $group.Name -Path $groupsPath -GroupScope $group.Scope -GroupCategory Security -Description $group.Desc -ErrorAction Stop
                     $created++
                 } else {
                     $skipped++
                 }
             } catch {
-                Write-Warning "Failed to create group '$name': $_"
+                Write-Warning "Failed to create group '$($group.Name)': $_"
             }
         }
         Write-Host "  Groups created: $created, skipped: $skipped" -ForegroundColor Cyan
-    }
+        
+    } -ArgumentList $Config.DomainNetBIOS
     
     # Create Users
     Write-Log "Creating User Accounts..."
     Invoke-Command -VMName $Config.VMName -Credential $domainCred -ScriptBlock {
-        param($DomainName)
+        param($NetBIOS, $DomainName)
         
         Import-Module ActiveDirectory
-        $users = Import-Csv "C:\it\users.csv"
+        $domainDN = (Get-ADDomain).DistinguishedName
+        
+        $users = @(
+            @{ Sam = "john.smith"; GivenName = "John"; Surname = "Smith"; Dept = "IT"; Title = "IT Administrator"; OU = "IT" }
+            @{ Sam = "jane.doe"; GivenName = "Jane"; Surname = "Doe"; Dept = "HR"; Title = "HR Manager"; OU = "HR" }
+            @{ Sam = "bob.wilson"; GivenName = "Bob"; Surname = "Wilson"; Dept = "Marketing"; Title = "Marketing Lead"; OU = "Marketing" }
+            @{ Sam = "alice.johnson"; GivenName = "Alice"; Surname = "Johnson"; Dept = "Accounting"; Title = "Senior Accountant"; OU = "Accounting" }
+            @{ Sam = "charlie.brown"; GivenName = "Charlie"; Surname = "Brown"; Dept = "Management"; Title = "Operations Manager"; OU = "Management" }
+            @{ Sam = "diana.ross"; GivenName = "Diana"; Surname = "Ross"; Dept = "Legal"; Title = "Legal Counsel"; OU = "Legal" }
+            @{ Sam = "edward.jones"; GivenName = "Edward"; Surname = "Jones"; Dept = "IT"; Title = "System Administrator"; OU = "IT" }
+            @{ Sam = "fiona.green"; GivenName = "Fiona"; Surname = "Green"; Dept = "HR"; Title = "HR Specialist"; OU = "HR" }
+            @{ Sam = "george.white"; GivenName = "George"; Surname = "White"; Dept = "Marketing"; Title = "Marketing Analyst"; OU = "Marketing" }
+            @{ Sam = "helen.black"; GivenName = "Helen"; Surname = "Black"; Dept = "Operations"; Title = "Operations Analyst"; OU = "Operations" }
+            @{ Sam = "ivan.gray"; GivenName = "Ivan"; Surname = "Gray"; Dept = "IT"; Title = "Network Engineer"; OU = "IT" }
+            @{ Sam = "julia.adams"; GivenName = "Julia"; Surname = "Adams"; Dept = "Accounting"; Title = "Accountant"; OU = "Accounting" }
+            @{ Sam = "kevin.miller"; GivenName = "Kevin"; Surname = "Miller"; Dept = "PR"; Title = "PR Specialist"; OU = "PR" }
+            @{ Sam = "laura.davis"; GivenName = "Laura"; Surname = "Davis"; Dept = "Purchasing"; Title = "Purchasing Agent"; OU = "Purchasing" }
+            @{ Sam = "mike.taylor"; GivenName = "Mike"; Surname = "Taylor"; Dept = "IT"; Title = "Help Desk Analyst"; OU = "IT" }
+            @{ Sam = "nancy.moore"; GivenName = "Nancy"; Surname = "Moore"; Dept = "HR"; Title = "Recruiter"; OU = "HR" }
+            @{ Sam = "oscar.martinez"; GivenName = "Oscar"; Surname = "Martinez"; Dept = "Accounting"; Title = "Accounting Clerk"; OU = "Accounting" }
+            @{ Sam = "patricia.lee"; GivenName = "Patricia"; Surname = "Lee"; Dept = "Legal"; Title = "Paralegal"; OU = "Legal" }
+            @{ Sam = "quincy.harris"; GivenName = "Quincy"; Surname = "Harris"; Dept = "Operations"; Title = "Operations Coordinator"; OU = "Operations" }
+            @{ Sam = "rachel.clark"; GivenName = "Rachel"; Surname = "Clark"; Dept = "Marketing"; Title = "Content Writer"; OU = "Marketing" }
+            @{ Sam = "steve.walker"; GivenName = "Steve"; Surname = "Walker"; Dept = "IT"; Title = "Security Analyst"; OU = "IT" }
+            @{ Sam = "tina.hall"; GivenName = "Tina"; Surname = "Hall"; Dept = "Management"; Title = "Project Manager"; OU = "Management" }
+            @{ Sam = "victor.young"; GivenName = "Victor"; Surname = "Young"; Dept = "Purchasing"; Title = "Procurement Specialist"; OU = "Purchasing" }
+            @{ Sam = "wendy.king"; GivenName = "Wendy"; Surname = "King"; Dept = "PR"; Title = "Communications Manager"; OU = "PR" }
+            @{ Sam = "xavier.scott"; GivenName = "Xavier"; Surname = "Scott"; Dept = "IT"; Title = "Database Administrator"; OU = "IT" }
+        )
+        
         $created = 0
         $skipped = 0
         $failed = 0
+        $password = ConvertTo-SecureString "P@ssw0rd123!" -AsPlainText -Force
         
         foreach ($user in $users) {
-            $sam = $user.SamAccountName.Trim()
-            
             try {
-                if (-not (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue)) {
-                    $userParams = @{
-                        SamAccountName        = $sam
-                        UserPrincipalName     = "$sam@$DomainName"
-                        Path                  = $user.Path.Trim()
-                        GivenName             = $user.GivenName
-                        Surname               = $user.Surname
-                        Name                  = $user.Name
-                        DisplayName           = $user.DisplayName
-                        Department            = $user.Department
-                        Title                 = $user.Title
-                        EmailAddress          = $user.Email
-                        AccountPassword       = (ConvertTo-SecureString $user.Password -AsPlainText -Force)
-                        Enabled               = $true
-                        PasswordNeverExpires  = $true
-                        ChangePasswordAtLogon = $false
-                    }
+                if (-not (Get-ADUser -Filter "SamAccountName -eq '$($user.Sam)'" -ErrorAction SilentlyContinue)) {
+                    $path = "OU=$($user.OU),OU=$NetBIOS Users,$domainDN"
+                    $name = "$($user.GivenName) $($user.Surname)"
                     
-                    New-ADUser @userParams -ErrorAction Stop
+                    New-ADUser -SamAccountName $user.Sam -UserPrincipalName "$($user.Sam)@$DomainName" `
+                        -Path $path -GivenName $user.GivenName -Surname $user.Surname -Name $name `
+                        -DisplayName $name -Department $user.Dept -Title $user.Title `
+                        -EmailAddress "$($user.Sam)@$DomainName" -AccountPassword $password `
+                        -Enabled $true -PasswordNeverExpires $true -ChangePasswordAtLogon $false -ErrorAction Stop
                     $created++
                 } else {
                     $skipped++
                 }
             } catch {
                 $failed++
-                Write-Warning "Failed to create user '$sam': $_"
+                Write-Warning "Failed to create user '$($user.Sam)': $_"
             }
         }
         Write-Host "  Users created: $created, skipped: $skipped, failed: $failed" -ForegroundColor Cyan
-    } -ArgumentList $Config.DomainName
+        
+    } -ArgumentList $Config.DomainNetBIOS, $Config.DomainName
     
     Write-Log "Bulk AD object creation completed" -Level Success
 }
@@ -1334,7 +1350,13 @@ function Install-DNSConfiguration {
         $ptrName = $IPParts[3]
         Add-DnsServerResourceRecordPtr -ZoneName $ReverseZone -Name $ptrName -PtrDomainName "$env:COMPUTERNAME.$DomainName" -ErrorAction SilentlyContinue
         
-        # Create useful DNS aliases (CNAMEs)
+        # Create useful DNS aliases (CNAMEs) - only if zone exists
+        $zoneExists = Get-DnsServerZone -Name $DomainName -ErrorAction SilentlyContinue
+        if (-not $zoneExists) {
+            Write-Host "  WARNING: DNS zone '$DomainName' not found - skipping aliases" -ForegroundColor Yellow
+            return
+        }
+        
         $aliases = @{
             'dc01'       = "$env:COMPUTERNAME.$DomainName"
             'mail'       = "$env:COMPUTERNAME.$DomainName"
@@ -1443,7 +1465,7 @@ function Install-CertificateServices {
 }
 
 function Install-BaseGPOs {
-    Write-Log "Creating baseline Group Policy Objects..."
+    Write-Log "Creating comprehensive Group Policy Objects..."
     
     $securePassword = ConvertTo-SecureString $Config.AdminPassword -AsPlainText -Force
     $domainCred = New-Object PSCredential("$($Config.DomainNetBIOS)\Administrator", $securePassword)
@@ -1452,101 +1474,434 @@ function Install-BaseGPOs {
         param($DomainName, $NetBIOS)
         
         Import-Module GroupPolicy
+        Import-Module ActiveDirectory
         $domainDN = (Get-ADDomain).DistinguishedName
         
-        # ========== PASSWORD POLICY GPO ==========
-        $pwdGpoName = "$NetBIOS - Password Policy"
+        $gposCreated = 0
+        
+        # ============================================================
+        # DOMAIN-WIDE SECURITY POLICIES
+        # ============================================================
+        
+        # ========== PASSWORD & LOCKOUT POLICY ==========
+        $pwdGpoName = "$NetBIOS - Domain Password Policy"
         if (-not (Get-GPO -Name $pwdGpoName -ErrorAction SilentlyContinue)) {
-            $pwdGpo = New-GPO -Name $pwdGpoName -Comment "Domain password and lockout policy"
-            $pwdGpo | New-GPLink -Target $domainDN -LinkEnabled Yes -ErrorAction SilentlyContinue
-            
-            # Password policy settings via registry (these map to security policy)
-            # Note: Actual password policy is set via Default Domain Policy or Fine-Grained
-            Write-Host "  Created: $pwdGpoName" -ForegroundColor Green
+            $gpo = New-GPO -Name $pwdGpoName -Comment "Domain-wide password and account lockout policy settings"
+            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -Order 1 -ErrorAction SilentlyContinue
+            Write-Host "  Created & Linked: $pwdGpoName -> Domain Root" -ForegroundColor Green
+            $gposCreated++
         }
         
-        # ========== SECURITY AUDIT POLICY GPO ==========
+        # ========== SECURITY AUDIT POLICY ==========
         $auditGpoName = "$NetBIOS - Security Audit Policy"
         if (-not (Get-GPO -Name $auditGpoName -ErrorAction SilentlyContinue)) {
-            $auditGpo = New-GPO -Name $auditGpoName -Comment "Security auditing and event logging"
-            $auditGpo | New-GPLink -Target $domainDN -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo = New-GPO -Name $auditGpoName -Comment "Advanced security auditing configuration"
+            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -ErrorAction SilentlyContinue
             
             # Enable advanced audit policy
             Set-GPRegistryValue -Name $auditGpoName -Key "HKLM\System\CurrentControlSet\Control\Lsa" -ValueName "SCENoApplyLegacyAuditPolicy" -Type DWord -Value 1 | Out-Null
+            # Audit logon events
+            Set-GPRegistryValue -Name $auditGpoName -Key "HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit" -ValueName "ProcessCreationIncludeCmdLine_Enabled" -Type DWord -Value 1 | Out-Null
             
-            Write-Host "  Created: $auditGpoName" -ForegroundColor Green
+            Write-Host "  Created & Linked: $auditGpoName -> Domain Root" -ForegroundColor Green
+            $gposCreated++
         }
         
-        # ========== WINDOWS UPDATE GPO ==========
-        $wsusGpoName = "$NetBIOS - Windows Update Policy"
+        # ========== KERBEROS POLICY ==========
+        $kerbGpoName = "$NetBIOS - Kerberos Security"
+        if (-not (Get-GPO -Name $kerbGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $kerbGpoName -Comment "Kerberos authentication hardening"
+            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -ErrorAction SilentlyContinue
+            Write-Host "  Created & Linked: $kerbGpoName -> Domain Root" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ============================================================
+        # COMPUTER POLICIES - ALL WORKSTATIONS
+        # ============================================================
+        
+        # ========== WINDOWS UPDATE POLICY ==========
+        $wsusGpoName = "$NetBIOS - WSUS Client Configuration"
         if (-not (Get-GPO -Name $wsusGpoName -ErrorAction SilentlyContinue)) {
-            $wsusGpo = New-GPO -Name $wsusGpoName -Comment "Windows Update configuration"
-            $wsusGpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo = New-GPO -Name $wsusGpoName -Comment "Windows Update and WSUS configuration for workstations"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
             
-            # Configure auto-update settings
+            # Auto-download and schedule install
             Set-GPRegistryValue -Name $wsusGpoName -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "NoAutoUpdate" -Type DWord -Value 0 | Out-Null
-            Set-GPRegistryValue -Name $wsusGpoName -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "AUOptions" -Type DWord -Value 3 | Out-Null
+            Set-GPRegistryValue -Name $wsusGpoName -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "AUOptions" -Type DWord -Value 4 | Out-Null
+            Set-GPRegistryValue -Name $wsusGpoName -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "ScheduledInstallDay" -Type DWord -Value 0 | Out-Null
+            Set-GPRegistryValue -Name $wsusGpoName -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "ScheduledInstallTime" -Type DWord -Value 3 | Out-Null
             
-            Write-Host "  Created: $wsusGpoName" -ForegroundColor Green
+            Write-Host "  Created & Linked: $wsusGpoName -> $NetBIOS Computers" -ForegroundColor Green
+            $gposCreated++
         }
         
-        # ========== DESKTOP SETTINGS GPO ==========
-        $desktopGpoName = "$NetBIOS - Desktop Settings"
-        if (-not (Get-GPO -Name $desktopGpoName -ErrorAction SilentlyContinue)) {
-            $desktopGpo = New-GPO -Name $desktopGpoName -Comment "User desktop configuration"
-            $desktopGpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+        # ========== WORKSTATION SECURITY BASELINE ==========
+        $wksSecGpoName = "$NetBIOS - Workstation Security Baseline"
+        if (-not (Get-GPO -Name $wksSecGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $wksSecGpoName -Comment "Security baseline for all workstations"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
             
-            # Remove Games link from Start Menu
+            # Disable SMBv1 client
+            Set-GPRegistryValue -Name $wksSecGpoName -Key "HKLM\System\CurrentControlSet\Services\mrxsmb10" -ValueName "Start" -Type DWord -Value 4 | Out-Null
+            # Disable SMBv1 server
+            Set-GPRegistryValue -Name $wksSecGpoName -Key "HKLM\System\CurrentControlSet\Services\LanmanServer\Parameters" -ValueName "SMB1" -Type DWord -Value 0 | Out-Null
+            # Enable SMB signing
+            Set-GPRegistryValue -Name $wksSecGpoName -Key "HKLM\System\CurrentControlSet\Services\LanmanWorkstation\Parameters" -ValueName "RequireSecuritySignature" -Type DWord -Value 1 | Out-Null
+            # Enable NTLMv2 only
+            Set-GPRegistryValue -Name $wksSecGpoName -Key "HKLM\System\CurrentControlSet\Control\Lsa" -ValueName "LmCompatibilityLevel" -Type DWord -Value 5 | Out-Null
+            # Disable LLMNR
+            Set-GPRegistryValue -Name $wksSecGpoName -Key "HKLM\Software\Policies\Microsoft\Windows NT\DNSClient" -ValueName "EnableMulticast" -Type DWord -Value 0 | Out-Null
+            # Disable NetBIOS over TCP/IP - handled via DHCP typically
+            
+            Write-Host "  Created & Linked: $wksSecGpoName -> $NetBIOS Computers" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== WINDOWS FIREWALL POLICY ==========
+        $fwGpoName = "$NetBIOS - Windows Firewall Policy"
+        if (-not (Get-GPO -Name $fwGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $fwGpoName -Comment "Windows Firewall configuration"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Enable firewall for domain profile
+            Set-GPRegistryValue -Name $fwGpoName -Key "HKLM\Software\Policies\Microsoft\WindowsFirewall\DomainProfile" -ValueName "EnableFirewall" -Type DWord -Value 1 | Out-Null
+            # Enable firewall for private profile  
+            Set-GPRegistryValue -Name $fwGpoName -Key "HKLM\Software\Policies\Microsoft\WindowsFirewall\StandardProfile" -ValueName "EnableFirewall" -Type DWord -Value 1 | Out-Null
+            # Enable for public profile
+            Set-GPRegistryValue -Name $fwGpoName -Key "HKLM\Software\Policies\Microsoft\WindowsFirewall\PublicProfile" -ValueName "EnableFirewall" -Type DWord -Value 1 | Out-Null
+            
+            Write-Host "  Created & Linked: $fwGpoName -> $NetBIOS Computers" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== BITLOCKER ENCRYPTION ==========
+        $bitlockerGpoName = "$NetBIOS - BitLocker Drive Encryption"
+        if (-not (Get-GPO -Name $bitlockerGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $bitlockerGpoName -Comment "BitLocker encryption settings for workstations"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Require TPM
+            Set-GPRegistryValue -Name $bitlockerGpoName -Key "HKLM\Software\Policies\Microsoft\FVE" -ValueName "UseTPM" -Type DWord -Value 1 | Out-Null
+            # Recovery options
+            Set-GPRegistryValue -Name $bitlockerGpoName -Key "HKLM\Software\Policies\Microsoft\FVE" -ValueName "OSRecovery" -Type DWord -Value 1 | Out-Null
+            # Save recovery key to AD
+            Set-GPRegistryValue -Name $bitlockerGpoName -Key "HKLM\Software\Policies\Microsoft\FVE" -ValueName "OSActiveDirectoryBackup" -Type DWord -Value 1 | Out-Null
+            
+            Write-Host "  Created & Linked: $bitlockerGpoName -> $NetBIOS Computers" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== POWER MANAGEMENT ==========
+        $powerGpoName = "$NetBIOS - Power Management"
+        if (-not (Get-GPO -Name $powerGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $powerGpoName -Comment "Power and sleep settings for workstations"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Turn off display after 15 minutes (plugged in)
+            Set-GPRegistryValue -Name $powerGpoName -Key "HKLM\Software\Policies\Microsoft\Power\PowerSettings\3C0BC021-C8A8-4E07-A973-6B14CBCB2B7E" -ValueName "ACSettingIndex" -Type DWord -Value 900 | Out-Null
+            # Sleep after 30 minutes (plugged in)
+            Set-GPRegistryValue -Name $powerGpoName -Key "HKLM\Software\Policies\Microsoft\Power\PowerSettings\29F6C1DB-86DA-48C5-9FDB-F2B67B1F44DA" -ValueName "ACSettingIndex" -Type DWord -Value 1800 | Out-Null
+            
+            Write-Host "  Created & Linked: $powerGpoName -> $NetBIOS Computers" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ============================================================
+        # USER POLICIES - ALL USERS
+        # ============================================================
+        
+        # ========== USER DESKTOP SETTINGS ==========
+        $desktopGpoName = "$NetBIOS - User Desktop Settings"
+        if (-not (Get-GPO -Name $desktopGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $desktopGpoName -Comment "Standard desktop configuration for all users"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Screen saver with password lock
+            Set-GPRegistryValue -Name $desktopGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveActive" -Type String -Value "1" | Out-Null
+            Set-GPRegistryValue -Name $desktopGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaverIsSecure" -Type String -Value "1" | Out-Null
+            Set-GPRegistryValue -Name $desktopGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveTimeOut" -Type String -Value "900" | Out-Null
+            # Remove Games from Start Menu
             Set-GPRegistryValue -Name $desktopGpoName -Key "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -ValueName "NoStartMenuMyGames" -Type DWord -Value 1 | Out-Null
             
-            Write-Host "  Created: $desktopGpoName" -ForegroundColor Green
+            Write-Host "  Created & Linked: $desktopGpoName -> $NetBIOS Users" -ForegroundColor Green
+            $gposCreated++
         }
         
-        # ========== SERVER SECURITY GPO ==========
-        $serverGpoName = "$NetBIOS - Server Security Baseline"
-        if (-not (Get-GPO -Name $serverGpoName -ErrorAction SilentlyContinue)) {
-            $serverGpo = New-GPO -Name $serverGpoName -Comment "Server security hardening"
-            
-            # Disable SMBv1
-            Set-GPRegistryValue -Name $serverGpoName -Key "HKLM\System\CurrentControlSet\Services\LanmanServer\Parameters" -ValueName "SMB1" -Type DWord -Value 0 | Out-Null
-            
-            # Enable SMB signing
-            Set-GPRegistryValue -Name $serverGpoName -Key "HKLM\System\CurrentControlSet\Services\LanmanServer\Parameters" -ValueName "RequireSecuritySignature" -Type DWord -Value 1 | Out-Null
-            
-            Write-Host "  Created: $serverGpoName" -ForegroundColor Green
+        # ========== FOLDER REDIRECTION ==========
+        $folderRedirGpoName = "$NetBIOS - Folder Redirection"
+        if (-not (Get-GPO -Name $folderRedirGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $folderRedirGpoName -Comment "Redirect Documents, Desktop to network share"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue
+            Write-Host "  Created (Disabled): $folderRedirGpoName -> $NetBIOS Users" -ForegroundColor Yellow
+            $gposCreated++
         }
         
-        # ========== WORKSTATION SECURITY GPO ==========
-        $wksGpoName = "$NetBIOS - Workstation Security"
-        if (-not (Get-GPO -Name $wksGpoName -ErrorAction SilentlyContinue)) {
-            $wksGpo = New-GPO -Name $wksGpoName -Comment "Workstation security settings"
-            $wksGpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
-            
-            # Screen saver with password
-            Set-GPRegistryValue -Name $wksGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveActive" -Type String -Value "1" | Out-Null
-            Set-GPRegistryValue -Name $wksGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaverIsSecure" -Type String -Value "1" | Out-Null
-            Set-GPRegistryValue -Name $wksGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveTimeOut" -Type String -Value "900" | Out-Null
-            
-            Write-Host "  Created: $wksGpoName" -ForegroundColor Green
+        # ========== DRIVE MAPPINGS ==========
+        $driveMapsGpoName = "$NetBIOS - Network Drive Mappings"
+        if (-not (Get-GPO -Name $driveMapsGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $driveMapsGpoName -Comment "Standard network drive mappings for users"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            Write-Host "  Created & Linked: $driveMapsGpoName -> $NetBIOS Users" -ForegroundColor Green
+            $gposCreated++
         }
         
-        # ========== CREDENTIAL GUARD GPO ==========
+        # ========== REMOVABLE STORAGE ==========
+        $usbGpoName = "$NetBIOS - Removable Storage Access"
+        if (-not (Get-GPO -Name $usbGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $usbGpoName -Comment "Control access to USB and removable media"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Deny write access to removable drives
+            Set-GPRegistryValue -Name $usbGpoName -Key "HKCU\Software\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}" -ValueName "Deny_Write" -Type DWord -Value 1 | Out-Null
+            
+            Write-Host "  Created & Linked: $usbGpoName -> $NetBIOS Users" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ============================================================
+        # DEPARTMENT-SPECIFIC POLICIES
+        # ============================================================
+        
+        # ========== IT DEPARTMENT - ADMIN TOOLS ==========
+        $itGpoName = "$NetBIOS - IT Department Settings"
+        if (-not (Get-GPO -Name $itGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $itGpoName -Comment "IT department specific settings - admin tools enabled"
+            $gpo | New-GPLink -Target "OU=IT,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Allow Remote Desktop
+            Set-GPRegistryValue -Name $itGpoName -Key "HKLM\System\CurrentControlSet\Control\Terminal Server" -ValueName "fDenyTSConnections" -Type DWord -Value 0 | Out-Null
+            # Allow running scripts
+            Set-GPRegistryValue -Name $itGpoName -Key "HKLM\Software\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell" -ValueName "ExecutionPolicy" -Type String -Value "RemoteSigned" | Out-Null
+            # Enable RSAT tools access
+            Set-GPRegistryValue -Name $itGpoName -Key "HKCU\Software\Policies\Microsoft\MMC" -ValueName "RestrictToPermittedSnapins" -Type DWord -Value 0 | Out-Null
+            
+            Write-Host "  Created & Linked: $itGpoName -> IT OU" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== IT WORKSTATIONS - ELEVATED ==========
+        $itWksGpoName = "$NetBIOS - IT Workstations"
+        if (-not (Get-GPO -Name $itWksGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $itWksGpoName -Comment "IT department workstations with elevated permissions"
+            $gpo | New-GPLink -Target "OU=IT,OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Allow RDP connections
+            Set-GPRegistryValue -Name $itWksGpoName -Key "HKLM\System\CurrentControlSet\Control\Terminal Server" -ValueName "fDenyTSConnections" -Type DWord -Value 0 | Out-Null
+            # Disable USB restrictions for IT
+            Set-GPRegistryValue -Name $itWksGpoName -Key "HKLM\Software\Policies\Microsoft\Windows\RemovableStorageDevices" -ValueName "Deny_All" -Type DWord -Value 0 | Out-Null
+            
+            Write-Host "  Created & Linked: $itWksGpoName -> IT Computers OU" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== HR DEPARTMENT - CONFIDENTIAL ==========
+        $hrGpoName = "$NetBIOS - HR Department Security"
+        if (-not (Get-GPO -Name $hrGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $hrGpoName -Comment "HR department - enhanced privacy settings"
+            $gpo | New-GPLink -Target "OU=HR,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Clear pagefile on shutdown (sensitive data)
+            Set-GPRegistryValue -Name $hrGpoName -Key "HKLM\System\CurrentControlSet\Control\Session Manager\Memory Management" -ValueName "ClearPageFileAtShutdown" -Type DWord -Value 1 | Out-Null
+            # Shorter screen lock timeout
+            Set-GPRegistryValue -Name $hrGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveTimeOut" -Type String -Value "300" | Out-Null
+            
+            Write-Host "  Created & Linked: $hrGpoName -> HR OU" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== ACCOUNTING/FINANCE - HIGH SECURITY ==========
+        $financeGpoName = "$NetBIOS - Finance Department Security"
+        if (-not (Get-GPO -Name $financeGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $financeGpoName -Comment "Finance/Accounting - strict security controls"
+            $gpo | New-GPLink -Target "OU=Accounting,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Block USB storage completely
+            Set-GPRegistryValue -Name $financeGpoName -Key "HKCU\Software\Policies\Microsoft\Windows\RemovableStorageDevices" -ValueName "Deny_All" -Type DWord -Value 1 | Out-Null
+            # Shortest screen lock
+            Set-GPRegistryValue -Name $financeGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveTimeOut" -Type String -Value "180" | Out-Null
+            # Prevent clipboard sharing
+            Set-GPRegistryValue -Name $financeGpoName -Key "HKCU\Software\Policies\Microsoft\Windows\CurrentVersion\Policies\System" -ValueName "DisableClipboardRedirection" -Type DWord -Value 1 | Out-Null
+            
+            Write-Host "  Created & Linked: $financeGpoName -> Accounting OU" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== MARKETING - RELAXED MEDIA ==========
+        $marketingGpoName = "$NetBIOS - Marketing Department"
+        if (-not (Get-GPO -Name $marketingGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $marketingGpoName -Comment "Marketing department - creative software access"
+            $gpo | New-GPLink -Target "OU=Marketing,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Allow USB for media transfers (override domain policy)
+            Set-GPRegistryValue -Name $marketingGpoName -Key "HKCU\Software\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}" -ValueName "Deny_Write" -Type DWord -Value 0 | Out-Null
+            
+            Write-Host "  Created & Linked: $marketingGpoName -> Marketing OU" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== MANAGEMENT - VIP SETTINGS ==========
+        $mgmtGpoName = "$NetBIOS - Management VIP Settings"
+        if (-not (Get-GPO -Name $mgmtGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $mgmtGpoName -Comment "Executive/Management - minimal restrictions"
+            $gpo | New-GPLink -Target "OU=Management,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Longer screen timeout for execs
+            Set-GPRegistryValue -Name $mgmtGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveTimeOut" -Type String -Value "1800" | Out-Null
+            # Allow full USB access
+            Set-GPRegistryValue -Name $mgmtGpoName -Key "HKCU\Software\Policies\Microsoft\Windows\RemovableStorageDevices" -ValueName "Deny_All" -Type DWord -Value 0 | Out-Null
+            
+            Write-Host "  Created & Linked: $mgmtGpoName -> Management OU" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ============================================================
+        # BROWSER & APPLICATION POLICIES
+        # ============================================================
+        
+        # ========== MICROSOFT EDGE POLICY ==========
+        $edgeGpoName = "$NetBIOS - Microsoft Edge Settings"
+        if (-not (Get-GPO -Name $edgeGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $edgeGpoName -Comment "Microsoft Edge browser configuration"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Set homepage
+            Set-GPRegistryValue -Name $edgeGpoName -Key "HKLM\Software\Policies\Microsoft\Edge" -ValueName "HomepageLocation" -Type String -Value "https://intranet.$DomainName" | Out-Null
+            # Block popups
+            Set-GPRegistryValue -Name $edgeGpoName -Key "HKLM\Software\Policies\Microsoft\Edge" -ValueName "DefaultPopupsSetting" -Type DWord -Value 2 | Out-Null
+            # Enable SmartScreen
+            Set-GPRegistryValue -Name $edgeGpoName -Key "HKLM\Software\Policies\Microsoft\Edge" -ValueName "SmartScreenEnabled" -Type DWord -Value 1 | Out-Null
+            # Disable password manager (use enterprise solution)
+            Set-GPRegistryValue -Name $edgeGpoName -Key "HKLM\Software\Policies\Microsoft\Edge" -ValueName "PasswordManagerEnabled" -Type DWord -Value 0 | Out-Null
+            
+            Write-Host "  Created & Linked: $edgeGpoName -> $NetBIOS Users" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== OFFICE 365 / M365 SETTINGS ==========
+        $officeGpoName = "$NetBIOS - Microsoft Office Settings"
+        if (-not (Get-GPO -Name $officeGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $officeGpoName -Comment "Microsoft Office/M365 configuration"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Block macros from internet
+            Set-GPRegistryValue -Name $officeGpoName -Key "HKCU\Software\Policies\Microsoft\Office\16.0\Excel\Security" -ValueName "blockcontentexecutionfrominternet" -Type DWord -Value 1 | Out-Null
+            Set-GPRegistryValue -Name $officeGpoName -Key "HKCU\Software\Policies\Microsoft\Office\16.0\Word\Security" -ValueName "blockcontentexecutionfrominternet" -Type DWord -Value 1 | Out-Null
+            Set-GPRegistryValue -Name $officeGpoName -Key "HKCU\Software\Policies\Microsoft\Office\16.0\PowerPoint\Security" -ValueName "blockcontentexecutionfrominternet" -Type DWord -Value 1 | Out-Null
+            # Disable VBA for Office applications
+            Set-GPRegistryValue -Name $officeGpoName -Key "HKCU\Software\Policies\Microsoft\Office\16.0\Common\Security" -ValueName "VBAWarnings" -Type DWord -Value 4 | Out-Null
+            
+            Write-Host "  Created & Linked: $officeGpoName -> $NetBIOS Users" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ============================================================
+        # SECURITY HARDENING POLICIES
+        # ============================================================
+        
+        # ========== CREDENTIAL GUARD ==========
         $credGuardGpoName = "$NetBIOS - Credential Guard"
         if (-not (Get-GPO -Name $credGuardGpoName -ErrorAction SilentlyContinue)) {
-            $credGuardGpo = New-GPO -Name $credGuardGpoName -Comment "Windows Credential Guard (Win10+)"
+            $gpo = New-GPO -Name $credGuardGpoName -Comment "Windows Credential Guard (Windows 10/11 Enterprise)"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue
             
-            # Virtualization-based security
+            # Enable VBS
             Set-GPRegistryValue -Name $credGuardGpoName -Key "HKLM\System\CurrentControlSet\Control\DeviceGuard" -ValueName "EnableVirtualizationBasedSecurity" -Type DWord -Value 1 | Out-Null
             Set-GPRegistryValue -Name $credGuardGpoName -Key "HKLM\System\CurrentControlSet\Control\Lsa" -ValueName "LsaCfgFlags" -Type DWord -Value 1 | Out-Null
             
-            Write-Host "  Created: $credGuardGpoName" -ForegroundColor Green
+            Write-Host "  Created (Disabled): $credGuardGpoName -> $NetBIOS Computers" -ForegroundColor Yellow
+            $gposCreated++
         }
         
-        Write-Host "  GPO creation complete" -ForegroundColor Cyan
+        # ========== APPLOCKER / SOFTWARE RESTRICTION ==========
+        $applockerGpoName = "$NetBIOS - Application Control Policy"
+        if (-not (Get-GPO -Name $applockerGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $applockerGpoName -Comment "AppLocker / Software Restriction Policies"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue
+            Write-Host "  Created (Disabled): $applockerGpoName -> $NetBIOS Computers" -ForegroundColor Yellow
+            $gposCreated++
+        }
+        
+        # ========== WINDOWS DEFENDER ==========
+        $defenderGpoName = "$NetBIOS - Windows Defender Antivirus"
+        if (-not (Get-GPO -Name $defenderGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $defenderGpoName -Comment "Windows Defender AV configuration"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Enable real-time protection
+            Set-GPRegistryValue -Name $defenderGpoName -Key "HKLM\Software\Policies\Microsoft\Windows Defender\Real-Time Protection" -ValueName "DisableRealtimeMonitoring" -Type DWord -Value 0 | Out-Null
+            # Enable cloud protection
+            Set-GPRegistryValue -Name $defenderGpoName -Key "HKLM\Software\Policies\Microsoft\Windows Defender\Spynet" -ValueName "SpynetReporting" -Type DWord -Value 2 | Out-Null
+            # Enable PUA protection
+            Set-GPRegistryValue -Name $defenderGpoName -Key "HKLM\Software\Policies\Microsoft\Windows Defender" -ValueName "PUAProtection" -Type DWord -Value 1 | Out-Null
+            
+            Write-Host "  Created & Linked: $defenderGpoName -> $NetBIOS Computers" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ========== REMOTE DESKTOP RESTRICTIONS ==========
+        $rdpGpoName = "$NetBIOS - Remote Desktop Policy"
+        if (-not (Get-GPO -Name $rdpGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $rdpGpoName -Comment "Remote Desktop security settings"
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            
+            # Disable RDP by default
+            Set-GPRegistryValue -Name $rdpGpoName -Key "HKLM\System\CurrentControlSet\Control\Terminal Server" -ValueName "fDenyTSConnections" -Type DWord -Value 1 | Out-Null
+            # Require NLA
+            Set-GPRegistryValue -Name $rdpGpoName -Key "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -ValueName "UserAuthentication" -Type DWord -Value 1 | Out-Null
+            # Set encryption level high
+            Set-GPRegistryValue -Name $rdpGpoName -Key "HKLM\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -ValueName "MinEncryptionLevel" -Type DWord -Value 3 | Out-Null
+            
+            Write-Host "  Created & Linked: $rdpGpoName -> $NetBIOS Computers" -ForegroundColor Green
+            $gposCreated++
+        }
+        
+        # ============================================================
+        # LEGACY / DISABLED POLICIES (for discovery)
+        # ============================================================
+        
+        # ========== LEGACY IE POLICY ==========
+        $legacyIEGpoName = "$NetBIOS - LEGACY Internet Explorer (Deprecated)"
+        if (-not (Get-GPO -Name $legacyIEGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $legacyIEGpoName -Comment "DEPRECATED - Legacy IE11 settings - DO NOT USE"
+            # Not linked - orphaned GPO for discovery
+            Write-Host "  Created (Orphaned): $legacyIEGpoName" -ForegroundColor DarkYellow
+            $gposCreated++
+        }
+        
+        # ========== OLD WSUS POLICY ==========
+        $oldWsusGpoName = "$NetBIOS - OLD WSUS Server (Deprecated)"
+        if (-not (Get-GPO -Name $oldWsusGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $oldWsusGpoName -Comment "DEPRECATED - Points to decommissioned WSUS server"
+            Set-GPRegistryValue -Name $oldWsusGpoName -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate" -ValueName "WUServer" -Type String -Value "http://oldwsus.internal:8530" | Out-Null
+            # Not linked
+            Write-Host "  Created (Orphaned): $oldWsusGpoName" -ForegroundColor DarkYellow
+            $gposCreated++
+        }
+        
+        # ========== TEST POLICY ==========
+        $testGpoName = "$NetBIOS - TEST Policy (Remove Before Production)"
+        if (-not (Get-GPO -Name $testGpoName -ErrorAction SilentlyContinue)) {
+            $gpo = New-GPO -Name $testGpoName -Comment "TEST - Created for testing purposes - should be deleted"
+            # Not linked
+            Write-Host "  Created (Orphaned): $testGpoName" -ForegroundColor DarkYellow
+            $gposCreated++
+        }
+        
+        # ============================================================
+        # SUMMARY
+        # ============================================================
+        
+        Write-Host ""
+        Write-Host "  GPO Summary:" -ForegroundColor Cyan
+        $allGpos = Get-GPO -All
+        $linkedGpos = $allGpos | Where-Object { (Get-GPOReport -Guid $_.Id -ReportType XML | Select-String -Pattern '<LinksTo>').Count -gt 0 }
+        Write-Host "    Total GPOs created: $gposCreated" -ForegroundColor White
+        Write-Host "    Total GPOs in domain: $($allGpos.Count)" -ForegroundColor White
         
     } -ArgumentList $Config.DomainName, $Config.DomainNetBIOS
     
-    Write-Log "Baseline GPOs created" -Level Success
+    Write-Log "Comprehensive GPOs created and linked" -Level Success
 }
 
 function Install-FileShares {
@@ -1882,10 +2237,10 @@ function Install-FineGrainedPasswordPolicies {
                 -Description "Strict policy for service accounts"
             
             # Apply to service accounts (we'll create a group for this)
-            if (-not (Get-ADGroup -Filter "Name -eq 'Service Accounts'" -ErrorAction SilentlyContinue)) {
-                New-ADGroup -Name "Service Accounts" -GroupScope Global -GroupCategory Security -Path (Get-ADDomain).DistinguishedName -Description "All service accounts for FGPP"
+            if (-not (Get-ADGroup -Filter "Name -eq 'GG-Service-Accounts'" -ErrorAction SilentlyContinue)) {
+                New-ADGroup -Name "GG-Service-Accounts" -GroupScope Global -GroupCategory Security -Path (Get-ADDomain).DistinguishedName -Description "All service accounts for FGPP"
             }
-            Add-ADFineGrainedPasswordPolicySubject -Identity $svcPolicyName -Subjects "Service Accounts"
+            Add-ADFineGrainedPasswordPolicySubject -Identity $svcPolicyName -Subjects "GG-Service-Accounts"
             Write-Host "  Created: $svcPolicyName (25 char, 60 day)" -ForegroundColor Green
         }
         
@@ -1968,81 +2323,87 @@ function Install-ServiceAccountsWithSPNs {
         
         # Create Service Accounts OU if not exists
         $svcOU = "OU=Service Accounts,$domainDN"
-        if (-not (Get-ADOrganizationalUnit -Filter "DistinguishedName -eq '$svcOU'" -ErrorAction SilentlyContinue)) {
-            New-ADOrganizationalUnit -Name "Service Accounts" -Path $domainDN -ProtectedFromAccidentalDeletion $true
+        $existingSvcOU = Get-ADOrganizationalUnit -Filter "Name -eq 'Service Accounts'" -SearchBase $domainDN -SearchScope OneLevel -ErrorAction SilentlyContinue
+        if (-not $existingSvcOU) {
+            try {
+                New-ADOrganizationalUnit -Name "Service Accounts" -Path $domainDN -ProtectedFromAccidentalDeletion $false -ErrorAction Stop
+            } catch {
+                # OU might already exist or name conflict - use default Users container instead
+                $svcOU = "CN=Users,$domainDN"
+            }
         }
         
-        # Service account definitions with SPNs
+        # Service account definitions with SPNs (passwords 25+ chars for FGPP compliance)
         $serviceAccounts = @(
             @{
                 Name = 'svc-sql'
                 DisplayName = 'SQL Server Service'
                 Description = 'SQL Server Database Engine'
                 SPNs = @("MSSQLSvc/$DCFQDN", "MSSQLSvc/${DCFQDN}:1433")
-                Password = 'Sql$3rv1c3P@ss2025!'
+                Password = 'Sql$3rv1c3P@ssw0rd!Str0ng2025'
             },
             @{
                 Name = 'svc-iis'
                 DisplayName = 'IIS Application Pool'
                 Description = 'IIS Web Application Service'
                 SPNs = @("HTTP/$DCFQDN", "HTTP/$($DCFQDN.Split('.')[0])")
-                Password = 'IIS$3rv1c3P@ss2025!'
+                Password = 'IIS$3rv1c3P@ssw0rd!Str0ng2025'
             },
             @{
                 Name = 'svc-sccm'
                 DisplayName = 'SCCM Service Account'
                 Description = 'System Center Configuration Manager'
                 SPNs = @("SMS/$DCFQDN")
-                Password = 'SCCM$3rv1c3P@ss2025!'
+                Password = 'SCCM$3rv1c3P@ssw0rd!Str0ng25'
             },
             @{
                 Name = 'svc-backup'
                 DisplayName = 'Backup Service Account'
                 Description = 'Enterprise Backup Solution'
                 SPNs = @()
-                Password = 'B@ckup$3rv1c3P@ss2025!'
+                Password = 'B@ckup$3rv1c3P@ssw0rd!Str0ng25'
             },
             @{
                 Name = 'svc-scom'
                 DisplayName = 'SCOM Service Account'
                 Description = 'System Center Operations Manager'
                 SPNs = @()
-                Password = 'SCOM$3rv1c3P@ss2025!'
+                Password = 'SCOM$3rv1c3P@ssw0rd!Str0ng2025'
             },
             @{
                 Name = 'svc-adfs'
                 DisplayName = 'ADFS Service Account'
                 Description = 'Active Directory Federation Services'
                 SPNs = @("host/$DCFQDN")
-                Password = 'ADFS$3rv1c3P@ss2025!'
+                Password = 'ADFS$3rv1c3P@ssw0rd!Str0ng2025'
             },
             @{
                 Name = 'svc-sharepoint'
                 DisplayName = 'SharePoint Service Account'
                 Description = 'SharePoint Farm Account'
                 SPNs = @("HTTP/sharepoint.$DomainName", "HTTP/sharepoint")
-                Password = 'SP$3rv1c3P@ss2025!'
+                Password = 'SP$h@r3P01nt$3rv1c3P@ss!2025'
             },
             @{
                 Name = 'svc-exchange'
                 DisplayName = 'Exchange Service Account'
                 Description = 'Microsoft Exchange Services'
                 SPNs = @("exchangeMDB/$DCFQDN", "exchangeRFR/$DCFQDN")
-                Password = 'Exch$3rv1c3P@ss2025!'
+                Password = 'Exch@ng3$3rv1c3P@ssw0rd!2025'
             },
             @{
                 Name = 'svc-veeam'
                 DisplayName = 'Veeam Service Account'
                 Description = 'Veeam Backup & Replication'
                 SPNs = @()
-                Password = 'V33@m$3rv1c3P@ss2025!'
+                Password = 'V33@mB@ckup$3rv1c3P@ss!2025'
             },
             @{
                 Name = 'svc-scan'
                 DisplayName = 'Scanner Service Account'
                 Description = 'Network Scanner/Copier Service'
                 SPNs = @()
-                Password = 'Sc@n$3rv1c3P@ss2025!'
+                Password = 'Sc@nn3r$3rv1c3P@ssw0rd!2025'
             }
         )
         
@@ -2050,26 +2411,30 @@ function Install-ServiceAccountsWithSPNs {
         foreach ($svc in $serviceAccounts) {
             $sam = $svc.Name
             if (-not (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue)) {
-                $userParams = @{
-                    Name                  = $svc.DisplayName
-                    SamAccountName        = $sam
-                    UserPrincipalName     = "$sam@$DomainName"
-                    DisplayName           = $svc.DisplayName
-                    Description           = $svc.Description
-                    Path                  = $svcOU
-                    AccountPassword       = (ConvertTo-SecureString $svc.Password -AsPlainText -Force)
-                    Enabled               = $true
-                    PasswordNeverExpires  = $true
-                    CannotChangePassword  = $true
-                    ServicePrincipalNames = $svc.SPNs
+                try {
+                    $userParams = @{
+                        Name                  = $svc.DisplayName
+                        SamAccountName        = $sam
+                        UserPrincipalName     = "$sam@$DomainName"
+                        DisplayName           = $svc.DisplayName
+                        Description           = $svc.Description
+                        Path                  = $svcOU
+                        AccountPassword       = (ConvertTo-SecureString $svc.Password -AsPlainText -Force)
+                        Enabled               = $true
+                        PasswordNeverExpires  = $true
+                        CannotChangePassword  = $true
+                        ServicePrincipalNames = $svc.SPNs
+                    }
+                    
+                    New-ADUser @userParams -ErrorAction Stop
+                    
+                    # Add to Service Accounts group for FGPP
+                    Add-ADGroupMember -Identity "GG-Service-Accounts" -Members $sam -ErrorAction SilentlyContinue
+                    
+                    $created++
+                } catch {
+                    Write-Warning "Failed to create service account '$sam': $_"
                 }
-                
-                New-ADUser @userParams
-                
-                # Add to Service Accounts group for FGPP
-                Add-ADGroupMember -Identity "Service Accounts" -Members $sam -ErrorAction SilentlyContinue
-                
-                $created++
             }
         }
         
@@ -2257,8 +2622,14 @@ function Install-StaleObjects {
         
         # Create Disabled Users OU
         $disabledOU = "OU=Disabled Accounts,$domainDN"
-        if (-not (Get-ADOrganizationalUnit -Filter "DistinguishedName -eq '$disabledOU'" -ErrorAction SilentlyContinue)) {
-            New-ADOrganizationalUnit -Name "Disabled Accounts" -Path $domainDN -ProtectedFromAccidentalDeletion $false
+        $existingDisabledOU = Get-ADOrganizationalUnit -Filter "Name -eq 'Disabled Accounts'" -SearchBase $domainDN -SearchScope OneLevel -ErrorAction SilentlyContinue
+        if (-not $existingDisabledOU) {
+            try {
+                New-ADOrganizationalUnit -Name "Disabled Accounts" -Path $domainDN -ProtectedFromAccidentalDeletion $false -ErrorAction Stop
+            } catch {
+                # Use default if creation fails
+                $disabledOU = "CN=Users,$domainDN"
+            }
         }
         
         # Create terminated/disabled users
