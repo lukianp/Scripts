@@ -1487,7 +1487,7 @@ function Install-BaseGPOs {
         $pwdGpoName = "$NetBIOS - Domain Password Policy"
         if (-not (Get-GPO -Name $pwdGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $pwdGpoName -Comment "Domain-wide password and account lockout policy settings"
-            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -Order 1 -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -Order 1 -ErrorAction SilentlyContinue | Out-Null
             Write-Host "  Created & Linked: $pwdGpoName -> Domain Root" -ForegroundColor Green
             $gposCreated++
         }
@@ -1496,7 +1496,7 @@ function Install-BaseGPOs {
         $auditGpoName = "$NetBIOS - Security Audit Policy"
         if (-not (Get-GPO -Name $auditGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $auditGpoName -Comment "Advanced security auditing configuration"
-            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Enable advanced audit policy
             Set-GPRegistryValue -Name $auditGpoName -Key "HKLM\System\CurrentControlSet\Control\Lsa" -ValueName "SCENoApplyLegacyAuditPolicy" -Type DWord -Value 1 | Out-Null
@@ -1511,7 +1511,7 @@ function Install-BaseGPOs {
         $kerbGpoName = "$NetBIOS - Kerberos Security"
         if (-not (Get-GPO -Name $kerbGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $kerbGpoName -Comment "Kerberos authentication hardening"
-            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target $domainDN -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             Write-Host "  Created & Linked: $kerbGpoName -> Domain Root" -ForegroundColor Green
             $gposCreated++
         }
@@ -1524,7 +1524,7 @@ function Install-BaseGPOs {
         $wsusGpoName = "$NetBIOS - WSUS Client Configuration"
         if (-not (Get-GPO -Name $wsusGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $wsusGpoName -Comment "Windows Update and WSUS configuration for workstations"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Auto-download and schedule install
             Set-GPRegistryValue -Name $wsusGpoName -Key "HKLM\Software\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "NoAutoUpdate" -Type DWord -Value 0 | Out-Null
@@ -1540,7 +1540,7 @@ function Install-BaseGPOs {
         $wksSecGpoName = "$NetBIOS - Workstation Security Baseline"
         if (-not (Get-GPO -Name $wksSecGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $wksSecGpoName -Comment "Security baseline for all workstations"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Disable SMBv1 client
             Set-GPRegistryValue -Name $wksSecGpoName -Key "HKLM\System\CurrentControlSet\Services\mrxsmb10" -ValueName "Start" -Type DWord -Value 4 | Out-Null
@@ -1562,7 +1562,7 @@ function Install-BaseGPOs {
         $fwGpoName = "$NetBIOS - Windows Firewall Policy"
         if (-not (Get-GPO -Name $fwGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $fwGpoName -Comment "Windows Firewall configuration"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Enable firewall for domain profile
             Set-GPRegistryValue -Name $fwGpoName -Key "HKLM\Software\Policies\Microsoft\WindowsFirewall\DomainProfile" -ValueName "EnableFirewall" -Type DWord -Value 1 | Out-Null
@@ -1579,7 +1579,7 @@ function Install-BaseGPOs {
         $bitlockerGpoName = "$NetBIOS - BitLocker Drive Encryption"
         if (-not (Get-GPO -Name $bitlockerGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $bitlockerGpoName -Comment "BitLocker encryption settings for workstations"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Require TPM
             Set-GPRegistryValue -Name $bitlockerGpoName -Key "HKLM\Software\Policies\Microsoft\FVE" -ValueName "UseTPM" -Type DWord -Value 1 | Out-Null
@@ -1596,7 +1596,7 @@ function Install-BaseGPOs {
         $powerGpoName = "$NetBIOS - Power Management"
         if (-not (Get-GPO -Name $powerGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $powerGpoName -Comment "Power and sleep settings for workstations"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Turn off display after 15 minutes (plugged in)
             Set-GPRegistryValue -Name $powerGpoName -Key "HKLM\Software\Policies\Microsoft\Power\PowerSettings\3C0BC021-C8A8-4E07-A973-6B14CBCB2B7E" -ValueName "ACSettingIndex" -Type DWord -Value 900 | Out-Null
@@ -1615,7 +1615,7 @@ function Install-BaseGPOs {
         $desktopGpoName = "$NetBIOS - User Desktop Settings"
         if (-not (Get-GPO -Name $desktopGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $desktopGpoName -Comment "Standard desktop configuration for all users"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Screen saver with password lock
             Set-GPRegistryValue -Name $desktopGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveActive" -Type String -Value "1" | Out-Null
@@ -1632,7 +1632,7 @@ function Install-BaseGPOs {
         $folderRedirGpoName = "$NetBIOS - Folder Redirection"
         if (-not (Get-GPO -Name $folderRedirGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $folderRedirGpoName -Comment "Redirect Documents, Desktop to network share"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue | Out-Null
             Write-Host "  Created (Disabled): $folderRedirGpoName -> $NetBIOS Users" -ForegroundColor Yellow
             $gposCreated++
         }
@@ -1641,7 +1641,7 @@ function Install-BaseGPOs {
         $driveMapsGpoName = "$NetBIOS - Network Drive Mappings"
         if (-not (Get-GPO -Name $driveMapsGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $driveMapsGpoName -Comment "Standard network drive mappings for users"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             Write-Host "  Created & Linked: $driveMapsGpoName -> $NetBIOS Users" -ForegroundColor Green
             $gposCreated++
         }
@@ -1650,7 +1650,7 @@ function Install-BaseGPOs {
         $usbGpoName = "$NetBIOS - Removable Storage Access"
         if (-not (Get-GPO -Name $usbGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $usbGpoName -Comment "Control access to USB and removable media"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Deny write access to removable drives
             Set-GPRegistryValue -Name $usbGpoName -Key "HKCU\Software\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}" -ValueName "Deny_Write" -Type DWord -Value 1 | Out-Null
@@ -1667,7 +1667,7 @@ function Install-BaseGPOs {
         $itGpoName = "$NetBIOS - IT Department Settings"
         if (-not (Get-GPO -Name $itGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $itGpoName -Comment "IT department specific settings - admin tools enabled"
-            $gpo | New-GPLink -Target "OU=IT,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=IT,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Allow Remote Desktop
             Set-GPRegistryValue -Name $itGpoName -Key "HKLM\System\CurrentControlSet\Control\Terminal Server" -ValueName "fDenyTSConnections" -Type DWord -Value 0 | Out-Null
@@ -1684,7 +1684,7 @@ function Install-BaseGPOs {
         $itWksGpoName = "$NetBIOS - IT Workstations"
         if (-not (Get-GPO -Name $itWksGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $itWksGpoName -Comment "IT department workstations with elevated permissions"
-            $gpo | New-GPLink -Target "OU=IT,OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=IT,OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Allow RDP connections
             Set-GPRegistryValue -Name $itWksGpoName -Key "HKLM\System\CurrentControlSet\Control\Terminal Server" -ValueName "fDenyTSConnections" -Type DWord -Value 0 | Out-Null
@@ -1699,7 +1699,7 @@ function Install-BaseGPOs {
         $hrGpoName = "$NetBIOS - HR Department Security"
         if (-not (Get-GPO -Name $hrGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $hrGpoName -Comment "HR department - enhanced privacy settings"
-            $gpo | New-GPLink -Target "OU=HR,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=HR,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Clear pagefile on shutdown (sensitive data)
             Set-GPRegistryValue -Name $hrGpoName -Key "HKLM\System\CurrentControlSet\Control\Session Manager\Memory Management" -ValueName "ClearPageFileAtShutdown" -Type DWord -Value 1 | Out-Null
@@ -1714,7 +1714,7 @@ function Install-BaseGPOs {
         $financeGpoName = "$NetBIOS - Finance Department Security"
         if (-not (Get-GPO -Name $financeGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $financeGpoName -Comment "Finance/Accounting - strict security controls"
-            $gpo | New-GPLink -Target "OU=Accounting,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=Accounting,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Block USB storage completely
             Set-GPRegistryValue -Name $financeGpoName -Key "HKCU\Software\Policies\Microsoft\Windows\RemovableStorageDevices" -ValueName "Deny_All" -Type DWord -Value 1 | Out-Null
@@ -1731,7 +1731,7 @@ function Install-BaseGPOs {
         $marketingGpoName = "$NetBIOS - Marketing Department"
         if (-not (Get-GPO -Name $marketingGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $marketingGpoName -Comment "Marketing department - creative software access"
-            $gpo | New-GPLink -Target "OU=Marketing,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=Marketing,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Allow USB for media transfers (override domain policy)
             Set-GPRegistryValue -Name $marketingGpoName -Key "HKCU\Software\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}" -ValueName "Deny_Write" -Type DWord -Value 0 | Out-Null
@@ -1744,7 +1744,7 @@ function Install-BaseGPOs {
         $mgmtGpoName = "$NetBIOS - Management VIP Settings"
         if (-not (Get-GPO -Name $mgmtGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $mgmtGpoName -Comment "Executive/Management - minimal restrictions"
-            $gpo | New-GPLink -Target "OU=Management,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=Management,OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Longer screen timeout for execs
             Set-GPRegistryValue -Name $mgmtGpoName -Key "HKCU\Control Panel\Desktop" -ValueName "ScreenSaveTimeOut" -Type String -Value "1800" | Out-Null
@@ -1763,7 +1763,7 @@ function Install-BaseGPOs {
         $edgeGpoName = "$NetBIOS - Microsoft Edge Settings"
         if (-not (Get-GPO -Name $edgeGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $edgeGpoName -Comment "Microsoft Edge browser configuration"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Set homepage
             Set-GPRegistryValue -Name $edgeGpoName -Key "HKLM\Software\Policies\Microsoft\Edge" -ValueName "HomepageLocation" -Type String -Value "https://intranet.$DomainName" | Out-Null
@@ -1782,7 +1782,7 @@ function Install-BaseGPOs {
         $officeGpoName = "$NetBIOS - Microsoft Office Settings"
         if (-not (Get-GPO -Name $officeGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $officeGpoName -Comment "Microsoft Office/M365 configuration"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Users,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Block macros from internet
             Set-GPRegistryValue -Name $officeGpoName -Key "HKCU\Software\Policies\Microsoft\Office\16.0\Excel\Security" -ValueName "blockcontentexecutionfrominternet" -Type DWord -Value 1 | Out-Null
@@ -1803,7 +1803,7 @@ function Install-BaseGPOs {
         $credGuardGpoName = "$NetBIOS - Credential Guard"
         if (-not (Get-GPO -Name $credGuardGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $credGuardGpoName -Comment "Windows Credential Guard (Windows 10/11 Enterprise)"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue | Out-Null
             
             # Enable VBS
             Set-GPRegistryValue -Name $credGuardGpoName -Key "HKLM\System\CurrentControlSet\Control\DeviceGuard" -ValueName "EnableVirtualizationBasedSecurity" -Type DWord -Value 1 | Out-Null
@@ -1817,7 +1817,7 @@ function Install-BaseGPOs {
         $applockerGpoName = "$NetBIOS - Application Control Policy"
         if (-not (Get-GPO -Name $applockerGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $applockerGpoName -Comment "AppLocker / Software Restriction Policies"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled No -ErrorAction SilentlyContinue | Out-Null
             Write-Host "  Created (Disabled): $applockerGpoName -> $NetBIOS Computers" -ForegroundColor Yellow
             $gposCreated++
         }
@@ -1826,7 +1826,7 @@ function Install-BaseGPOs {
         $defenderGpoName = "$NetBIOS - Windows Defender Antivirus"
         if (-not (Get-GPO -Name $defenderGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $defenderGpoName -Comment "Windows Defender AV configuration"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Enable real-time protection
             Set-GPRegistryValue -Name $defenderGpoName -Key "HKLM\Software\Policies\Microsoft\Windows Defender\Real-Time Protection" -ValueName "DisableRealtimeMonitoring" -Type DWord -Value 0 | Out-Null
@@ -1843,7 +1843,7 @@ function Install-BaseGPOs {
         $rdpGpoName = "$NetBIOS - Remote Desktop Policy"
         if (-not (Get-GPO -Name $rdpGpoName -ErrorAction SilentlyContinue)) {
             $gpo = New-GPO -Name $rdpGpoName -Comment "Remote Desktop security settings"
-            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue
+            $gpo | New-GPLink -Target "OU=$NetBIOS Computers,$domainDN" -LinkEnabled Yes -ErrorAction SilentlyContinue | Out-Null
             
             # Disable RDP by default
             Set-GPRegistryValue -Name $rdpGpoName -Key "HKLM\System\CurrentControlSet\Control\Terminal Server" -ValueName "fDenyTSConnections" -Type DWord -Value 1 | Out-Null
