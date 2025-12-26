@@ -46,6 +46,11 @@ function Get-UserConfiguration {
     $parentDCIP = Read-Host "  Parent DC IP Address [192.168.0.10]"
     if ([string]::IsNullOrWhiteSpace($parentDCIP)) { $parentDCIP = "192.168.0.10" }
     
+    # Get Parent DC VM Name for Hyper-V direct connection (required for DNS config)
+    $defaultParentVMName = "uran"
+    $parentVMName = Read-Host "  Parent DC Hyper-V VM Name [$defaultParentVMName]"
+    if ([string]::IsNullOrWhiteSpace($parentVMName)) { $parentVMName = $defaultParentVMName }
+    
     $parentAdminPassword = Read-Host "  Parent Domain Admin Password [LabAdmin2025!]"
     if ([string]::IsNullOrWhiteSpace($parentAdminPassword)) { $parentAdminPassword = "LabAdmin2025!" }
     
@@ -1304,6 +1309,97 @@ function Verify-TrustRelationship {
     Write-Log "Trust verification complete" -Level Success
 }
 
+function Verify-PostDeploymentHealth {
+    Write-Log "Running post-deployment health checks..."
+    
+    $securePassword = ConvertTo-SecureString $Config.AdminPassword -AsPlainText -Force
+    $childDomainCred = New-Object PSCredential("$($Config.ChildNetBIOS)\Administrator", $securePassword)
+    
+    $healthResults = Invoke-Command -VMName $Config.VMName -Credential $childDomainCred -ScriptBlock {
+        param($ParentDomain, $ParentDCIP, $ChildDomain, $SelfIP)
+        
+        $results = @{
+            DNSServers = @()
+            ParentResolution = $null
+            ParentDCResolution = $null
+            ReplicationStatus = $null
+            SysvolReady = $false
+        }
+        
+        # Check DNS server configuration
+        $dnsServers = (Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object { $_.ServerAddresses } | Select-Object -First 1).ServerAddresses
+        $results.DNSServers = $dnsServers
+        
+        # Verify DNS includes both self and parent
+        $hasSelf = $dnsServers -contains $SelfIP
+        $hasParent = $dnsServers -contains $ParentDCIP
+        
+        if (-not $hasParent) {
+            Write-Host "  WARNING: Parent DC not in DNS servers - adding..." -ForegroundColor Yellow
+            $adapter = Get-NetAdapter | Where-Object Status -eq "Up" | Select-Object -First 1
+            Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses @($SelfIP, $ParentDCIP)
+            $results.DNSServers = @($SelfIP, $ParentDCIP)
+        }
+        
+        # Test parent domain resolution
+        Clear-DnsClientCache
+        Start-Sleep -Seconds 2
+        try {
+            $parentResolve = Resolve-DnsName -Name $ParentDomain -Type A -DnsOnly -ErrorAction Stop
+            $results.ParentResolution = $parentResolve.IPAddress | Select-Object -First 1
+        } catch {
+            $results.ParentResolution = "FAILED"
+        }
+        
+        # Test parent DC hostname resolution
+        $parentDCName = (Resolve-DnsName -Name $ParentDCIP -Type PTR -ErrorAction SilentlyContinue).NameHost
+        if ($parentDCName) {
+            try {
+                $dcResolve = Resolve-DnsName -Name $parentDCName -Type A -DnsOnly -ErrorAction Stop
+                $results.ParentDCResolution = "$parentDCName -> $($dcResolve.IPAddress)"
+            } catch {
+                $results.ParentDCResolution = "FAILED"
+            }
+        }
+        
+        # Force replication
+        try {
+            repadmin /syncall /AdeP 2>&1 | Out-Null
+            $results.ReplicationStatus = "Initiated"
+        } catch {
+            $results.ReplicationStatus = "Failed to initiate"
+        }
+        
+        # Re-register DNS records
+        ipconfig /registerdns | Out-Null
+        nltest /dsregdns 2>&1 | Out-Null
+        
+        # Check SYSVOL
+        $results.SysvolReady = Test-Path "\\$ChildDomain\SYSVOL\$ChildDomain\Policies"
+        
+        return $results
+        
+    } -ArgumentList $Config.ParentDomain, $Config.ParentDCIP, $Config.ChildDomain, $Config.VMIP
+    
+    # Display results
+    Write-Host ""
+    Write-Host "  Post-Deployment Health Check:" -ForegroundColor Cyan
+    Write-Host "    DNS Servers:        $($healthResults.DNSServers -join ', ')" -ForegroundColor $(if($healthResults.DNSServers.Count -ge 2){'Green'}else{'Yellow'})
+    Write-Host "    Parent Resolution:  $($Config.ParentDomain) -> $($healthResults.ParentResolution)" -ForegroundColor $(if($healthResults.ParentResolution -eq $Config.ParentDCIP){'Green'}else{'Red'})
+    if ($healthResults.ParentDCResolution) {
+        Write-Host "    Parent DC:          $($healthResults.ParentDCResolution)" -ForegroundColor Green
+    }
+    Write-Host "    Replication:        $($healthResults.ReplicationStatus)" -ForegroundColor Green
+    Write-Host "    SYSVOL Ready:       $($healthResults.SysvolReady)" -ForegroundColor $(if($healthResults.SysvolReady){'Green'}else{'Yellow'})
+    Write-Host ""
+    
+    if ($healthResults.ParentResolution -ne $Config.ParentDCIP) {
+        Write-Log "WARNING: Parent domain resolution incorrect. You may need to manually verify DNS." -Level Warning
+    } else {
+        Write-Log "Post-deployment health checks passed" -Level Success
+    }
+}
+
 # ============================================
 # MAIN EXECUTION
 # ============================================
@@ -1325,6 +1421,7 @@ try {
     Start-VM -Name $Config.VMName
     
     Install-ChildDomainController
+    Verify-PostDeploymentHealth
     Install-PrivilegedAdminAccounts
     Install-BulkADObjects
     Install-TempShare
