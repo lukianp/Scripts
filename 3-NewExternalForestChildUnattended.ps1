@@ -1450,14 +1450,6 @@ function Verify-PostDeploymentHealth {
         Write-Log "Post-deployment health checks passed" -Level Success
     }
 }
-    Write-Host ""
-    
-    if ($Config.CreateTrust -and $healthResults.PrimaryResolution -ne $Config.PrimaryDCIP) {
-        Write-Log "WARNING: Primary domain resolution may need manual verification before trust creation." -Level Warning
-    } else {
-        Write-Log "Post-deployment health checks passed" -Level Success
-    }
-}
 
 # ============================================
 # MAIN EXECUTION
